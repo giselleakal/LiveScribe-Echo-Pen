@@ -1,0 +1,12 @@
+# raw pen data + generated site content
+data/
+output/
+
+# compiled pen client
+vendor/dumpscribe
+*.o
+
+# python
+__pycache__/
+*.pyc
+.venv/
