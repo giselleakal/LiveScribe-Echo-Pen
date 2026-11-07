@@ -8,10 +8,8 @@
 #                        pen via dumpscribe -> convert. Then run ./run
 #                        (or ./run sync serve) to view.
 #   ./run sync serve    download from the pen, convert + serve in one go
-#   ./run convert       conversion only (OCR auto-detected)
-#   ./run ocr           re-run conversion and force the OCR pass
-#   ./run stt           transcribe session audio; pass --session PRS-… to
-#                        limit to one recording (never run automatically)
+#   ./run convert       conversion only (no transcription)
+#   ./run ocr           OCR pages on demand
 #   ./run stt           transcribe session audio; pass --session PRS-… to
 #                        limit to one recording (never run automatically)
 #   ./run clean-pen     download the notebook, then delete it from the pen
@@ -36,16 +34,9 @@ usage() {
 }
 
 convert_only() {
-    # OCR flags: probe for a usable engine and pass --ocr along.
-    local args=()
-    if \
-        PYTHONPATH="$ROOT/src" "$PYTHON" -c "import ocr, sys; sys.exit(0 if (ocr.trocr_available() or ocr.available()) else 1)" 2>/dev/null; then
-        args+=(--ocr)
-    else
-        echo "note: no OCR engine available; pages get no transcription." >&2
-        echo "      install tesseract-ocr, or build the .venv (see README)." >&2
-    fi
-    "$PYTHON" "$ROOT/src/convert.py" "${args[@]}" "$@"
+    # Plain conversion, no transcription: OCR and STT are on-demand only
+    # (./run ocr, ./run stt, or the web UI Transcribe buttons).
+    "$PYTHON" "$ROOT/src/convert.py" "$@"
 }
 
 serve() {

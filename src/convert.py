@@ -510,6 +510,8 @@ def main(argv=None):
                     help="transcribe session audio (Moonshine) into transcripts")
     ap.add_argument("--session", default=None,
                     help="with --stt, transcribe only this session id")
+    ap.add_argument("--page", default=None,
+                    help="only OCR/render this one page id; others are reused")
     args = ap.parse_args(argv)
 
     do_ocr = args.ocr
@@ -574,6 +576,18 @@ def main(argv=None):
         src_rel = os.path.relpath(stf, ROOT)
         sig = file_sig(stf)
         prev = state.get("page_entries", {}).get(page_id)
+        if args.page is not None and page_id != args.page:
+            # single-page mode (on-demand OCR): reuse other pages so
+            # index.json stays complete without re-touching them.
+            if prev is not None:
+                state["sources"][src_rel] = file_sig(stf)
+                pages.append(dict(prev))
+                skipped_pages += 1
+                print("page %s: unchanged, skipping" % page_id)
+                continue
+            this_ocr = False  # never encoded before; render below, no OCR
+        else:
+            this_ocr = do_ocr
         reuse = (not args.force) and \
             state.get("sources", {}).get(src_rel) == sig and prev is not None and \
             os.path.exists(os.path.join(pages_out, page_id, "page.svg")) and \
@@ -599,7 +613,7 @@ def main(argv=None):
             "svg": "pages/%s/page.svg" % page_id,
             "thumb": "pages/%s/thumb.png" % page_id,
         }
-        if do_ocr:
+        if this_ocr:
             try:
                 text, kept = ocr_page(strokes, page_dir, engine,
                                       args.ocr_lang, args.ocr_psm)

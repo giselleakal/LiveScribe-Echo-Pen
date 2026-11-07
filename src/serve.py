@@ -56,6 +56,9 @@ PAGE_TPL = """<!doctype html>
    background: #fff; color: #b3261e; border: 1px solid #b3261e; border-radius: 6px;
    cursor: pointer; }}
  .delete:hover {{ background: #b3261e; color: #fff; }}
+ .transcribe {{ display: inline-block; margin-top: 8px; padding: 5px 12px; font-size: 12px;
+   background: #1a237e; color: #fff; border: none; border-radius: 6px; cursor: pointer; }}
+ .transcribe:hover {{ background: #303f9f; }}
  .sess .actions {{ margin-left: auto; }}
  details.transcript {{ margin-top: 8px; font-size: 13px; color: #333; }}
  details.transcript pre {{ white-space: pre-wrap; word-break: break-word;
@@ -91,6 +94,7 @@ PAGE_TPL = """<!doctype html>
 </main>
 <script>{search_js}</script>
 <script>{del_js}</script>
+<script>{transcribe_js}</script>
 </body></html>
 """
 
@@ -144,6 +148,37 @@ DEL_JS = """
 })();
 """
 
+TRANSCRIBE_JS = """
+(function () {
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('.transcribe') : null;
+    if (!btn) return;
+    e.preventDefault();
+    var kind = btn.getAttribute('data-kind');
+    var id = btn.getAttribute('data-id');
+    if (!confirm('Transcribe this ' + (kind === 'session' ? 'recording'
+        : 'page') + ' (' + id + ')? This may take a little while.')) return;
+    var old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Transcribing\u2026';
+    fetch('/api/transcribe/' + kind, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id })
+    }).then(function (r) { return r.json(); }).then(function (res) {
+      if (res.ok) { location.reload(); return; }
+      btn.disabled = false;
+      btn.textContent = old;
+      alert(res.error || 'Transcription failed.');
+    }).catch(function () {
+      btn.disabled = false;
+      btn.textContent = old;
+      alert('Transcription failed.');
+    });
+  });
+})();
+"""
+
 
 def build_index():
     """Build the index page.
@@ -180,10 +215,15 @@ def build_index():
         search = ("%s %s" % (p.get("id", ""), text)).lower()
         delete = ('<button class="delete" data-kind="page" data-id="%s">Delete</button>'
                   % html.escape(str(p["id"]), quote=True))
+        transcribe = ""
+        if not p.get("ocr"):
+            transcribe = ('<button class="transcribe" data-kind="page" '
+                          'data-id="%s">Transcribe</button>'
+                          % html.escape(str(p["id"]), quote=True))
         cards.append(
             '<div class="page" data-search="{search}"><a href="{svg}"><img src="{thumb}" '
             'alt="{id}"><div class="id">{id} &middot; {strokes} strokes</div></a>'
-            '{download}{delete}{transcript}</div>'
+            '{download}{transcribe}{delete}{transcript}</div>'
             .format(
                 search=html.escape(search, quote=True),
                 svg=html.escape(p["svg"], quote=True),
@@ -191,6 +231,7 @@ def build_index():
                 id=html.escape(str(p["id"])),
                 strokes=p["strokes"],
                 download=download,
+                transcribe=transcribe,
                 delete=delete,
                 transcript=transcript,
             )
@@ -231,15 +272,21 @@ def build_index():
             tx_search = " " + transcript
         search = ("%s %s%s"
                   % (s.get("id", ""), s.get("notebook", ""), tx_search)).lower()
+        transcribe = ""
+        if not transcript:
+            transcribe = ('<button class="transcribe" data-kind="session" '
+                          'data-id="%s">Transcribe</button>'
+                          % html.escape(str(s.get("id", "")), quote=True))
         sesses.append(
             '<div class="card sess" data-search="{search}">'
             '<div class="note">{note}</div>{players}'
-            '<div class="actions">{delete}</div>{tx}</div>'
+            '<div class="actions">{delete}{transcribe}</div>{tx}</div>'
             .format(
                 search=html.escape(search, quote=True),
                 note=note,
                 players=players,
                 delete=delete,
+                transcribe=transcribe,
                 tx=tx_block,
             )
         )
@@ -250,6 +297,7 @@ def build_index():
         sessions="\n".join(sesses),
         search_js=SEARCH_JS,
         del_js=DEL_JS,
+        transcribe_js=TRANSCRIBE_JS,
     )
     _LAST_GOOD = page
     return page
@@ -317,6 +365,25 @@ def delete_session(session_id):
     convert.save_state(state)
 
 
+def _run_convert_locked(argv):
+    """Run ``convert.py`` with ``argv`` under the run lock.
+
+    Sets ``ECHO_LOCK_HELD`` so the child skips locking (the caller holds
+    it). Returns True on success.
+    """
+    did_lock = convert.acquire_lock(wait=10.0)
+    try:
+        env = dict(os.environ)
+        env["ECHO_LOCK_HELD"] = "1"
+        proc = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "src", "convert.py")] + argv,
+            env=env, check=False)
+        return proc.returncode == 0
+    finally:
+        if did_lock:
+            convert.release_lock()
+
+
 def send_json(handler, status, payload):
     body = json.dumps(payload).encode("utf-8")
     handler.send_response(status)
@@ -346,7 +413,66 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         else:
             super().do_GET()
 
+    def _do_transcribe(self):
+        """On-demand transcription: OCR a page or STT a session."""
+        if "application/json" not in self.headers.get("Content-Type", ""):
+            send_json(self, 400,
+                      {"ok": False, "error": "Content-Type must be "
+                                             "application/json"})
+            return
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        if origin and origin not in ("http://" + host, "https://" + host,
+                                     "null"):
+            send_json(self, 403,
+                      {"ok": False, "error": "cross-origin request denied"})
+            return
+        kind = self.path[len("/api/transcribe/"):]
+        if kind not in ("page", "session"):
+            send_json(self, 404, {"ok": False, "error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            send_json(self, 400, {"ok": False, "error": "empty request body"})
+            return
+        try:
+            ident = json.loads(
+                self.rfile.read(length).decode("utf-8"))["id"]
+        except (ValueError, KeyError, IndexError) as e:
+            send_json(self, 400,
+                      {"ok": False, "error": "bad JSON body: %s" % e})
+            return
+        valid = PAGE_ID_RE.match(ident) if kind == "page" \
+            else SESSION_ID_RE.match(ident)
+        if not valid:
+            send_json(self, 400,
+                      {"ok": False, "error": "invalid id format"})
+            return
+        # the id must actually exist before we spend a long transcription
+        if kind == "page":
+            if not os.path.isdir(os.path.join(ROOT, "data", "data", ident)):
+                send_json(self, 404,
+                          {"ok": False, "error": "no such page"})
+                return
+        else:
+            if not find_session_dirs(ident):
+                send_json(self, 404,
+                          {"ok": False, "error": "no such session"})
+                return
+        argv = ["--ocr", "--page", ident] if kind == "page" \
+            else ["--stt", "--session", ident]
+        if not _run_convert_locked(argv):
+            send_json(self, 500,
+                      {"ok": False, "error": "transcription failed"})
+            return
+        send_json(self, 200, {"ok": True})
+
     def do_POST(self):
+        if self.path.startswith("/api/transcribe/"):
+            return self._do_transcribe()
         if not self.path.startswith("/api/delete/"):
             send_json(self, 404, {"ok": False, "error": "not found"})
             return
