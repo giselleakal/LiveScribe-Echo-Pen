@@ -48,10 +48,11 @@ PAGE_TPL = """<!doctype html>
  header {{ padding:34px 24px 46px; color:#fff;
     background: linear-gradient(135deg, #1a237e 0%, #3949ab 48%, #7c3aed 100%); }}
  header .inner {{ max-width:1080px; margin:0 auto; }}
- header h1 {{ margin:0; font-size:26px; letter-spacing:-0.02em; }}
+ header h1 {{ margin:0; font-size:clamp(22px, 4vw, 28px); letter-spacing:-0.02em; }}
  header h1 a {{ color:#fff; text-decoration:none; }}
- header p {{ margin:6px 0 0; opacity:.92; font-size:14px; }}
- main {{ max-width:1080px; margin:0 auto; padding:0 20px 56px; }}
+ header p {{ margin:6px 0 0; opacity:.92; font-size:clamp(12px, 2vw, 14px); }}
+ main {{ max-width:1080px; margin:0 auto; padding:0 clamp(14px, 4vw, 20px) 56px; }}
+ img {{ max-width:100%; }}
  .search {{ display:flex; gap:12px; align-items:center; margin:-22px auto 0; max-width:620px;
     background: var(--card); border:1px solid var(--line); border-radius:14px;
     padding:6px 8px 6px 16px; box-shadow:0 6px 20px rgba(30,41,59,.10);
@@ -94,17 +95,32 @@ PAGE_TPL = """<!doctype html>
     background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px;
     margin:0 0 10px; }}
  audio {{ width:100%; margin-top:4px; border-radius:9px; }}
- .sess {{ display:flex; gap:18px; align-items:center; }}
- .sess .note {{ flex:1; min-width:0; font-size:13px; color:#4b5563; }}
- .sess .note b {{ font-size:14px; color:#111827; }}
- .sess .note a {{ color:var(--ink); text-decoration:none; font-weight:600; }}
- .sess .note a:hover {{ text-decoration:underline; }}
- .sess audio {{ max-width:420px; }}
- .sess .actions {{ margin-left:auto; margin-top:0; }}
+ .sess {{ display:block; }}
+ .sess-head {{ display:flex; align-items:flex-start; gap:16px; flex-wrap:wrap; }}
+ .sess-head .note {{ flex:1; min-width:220px; font-size:13px; color:#4b5563; }}
+ .sess-head .note b {{ font-size:14px; color:#111827; }}
+ .sess-head .note a {{ color:var(--ink); text-decoration:none; font-weight:600; }}
+ .sess-head .note a:hover {{ text-decoration:underline; }}
+ .sess-head .actions {{ margin-left:auto; }}
+ .players {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(250px,1fr));
+    gap:8px; margin-top:12px; }}
+ .players audio {{ width:100%; }}
+ .part .plabel {{ font-size:11px; color:var(--muted); margin-bottom:3px; }}
+ .page .actions, .sess-head .actions {{ display:flex; gap:8px; margin-top:0; flex-wrap:wrap; }}
  .page[hidden] {{ display:none; }}
+ @media (max-width:760px) {{ .search {{ max-width:100%; margin-top:-20px; }}
+   .grid {{ gap:16px; }} }}
  @media (max-width:680px) {{ header {{ padding:26px 18px 40px; }}
-   .sess {{ flex-direction:column; align-items:stretch; }}
-   .sess audio {{ max-width:100%; }} .sess .actions {{ margin-left:0; margin-top:10px; }} }}
+   .sess-head {{ flex-direction:column; align-items:stretch; }}
+   .sess-head .actions {{ margin-left:0; }}
+   .players {{ grid-template-columns:1fr; }} }}
+ @media (max-width:460px) {{ header {{ padding:22px 16px 36px; }}
+   .search {{ padding:6px; }} .search input {{ font-size:14px; }}
+   .grid {{ grid-template-columns:1fr; gap:14px; }}
+   .card {{ padding:14px; }}
+   .page .actions, .sess-head .actions {{ flex-direction:column; align-items:stretch; }}
+   a.download, .transcribe, .delete {{ width:100%; justify-content:center; }}
+   h2 {{ margin:24px 0 10px; }} }}
 </style>
 </head><body>
 <header><div class="inner">
@@ -274,8 +290,17 @@ def build_index():
         urls = s.get("urls") or []
         if not urls:
             continue
-        players = "".join('<audio controls src="%s"></audio>'
-                          % html.escape(u, quote=True) for u in urls)
+        if len(urls) == 1:
+            players = ('<audio controls src="%s"></audio>'
+                       % html.escape(urls[0], quote=True))
+        else:
+            parts = []
+            for i, u in enumerate(urls, 1):
+                parts.append(
+                    '<div class="part"><div class="plabel">Part %d</div>'
+                    '<audio controls src="%s"></audio></div>'
+                    % (i, html.escape(u, quote=True)))
+            players = "".join(parts)
         parts = " (%d parts)" % len(urls) if len(urls) > 1 else ""
         note = html.escape(str(s.get("id", "")))
         if s.get("notebook"):
@@ -312,14 +337,15 @@ def build_index():
                           % html.escape(str(s.get("id", "")), quote=True))
         sesses.append(
             '<div class="card sess" data-search="{search}">'
-            '<div class="note">{note}</div>{players}'
-            '<div class="actions">{delete}{transcribe}</div>{tx}</div>'
+            '<div class="sess-head"><div class="note">{note}</div>'
+            '<div class="actions">{delete}{transcribe}</div></div>'
+            '<div class="players">{players}</div>{tx}</div>'
             .format(
                 search=html.escape(search, quote=True),
                 note=note,
-                players=players,
                 delete=delete,
                 transcribe=transcribe,
+                players=players,
                 tx=tx_block,
             )
         )
