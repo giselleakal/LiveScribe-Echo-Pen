@@ -37,59 +37,90 @@ PAGE_TPL = """<!doctype html>
 <html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Notebook</title>
 <style>
- body {{ font-family: system-ui, sans-serif; margin: 0; background: #f4f5f7; color: #222; }}
- header {{ padding: 16px 24px; background: #1a237e; color: #fff; }}
- header a {{ color: #fff; text-decoration: none; }}
- main {{ max-width: 1080px; margin: 0 auto; padding: 24px; }}
- .card {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 20px; }}
- .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }}
- .page a {{ display: block; text-align: center; color: #1a237e; text-decoration: none; }}
- .page img {{ width: 100%; border: 1px solid #ccc; border-radius: 6px; }}
- .page .id {{ font-size: 13px; margin-top: 6px; }}
- .page a.download {{ display: block; width: fit-content; margin: 8px auto 0;
-   padding: 6px 10px; font-size: 13px; background: #1a237e; color: #fff;
-   border-radius: 6px; }}
- .page a.download:hover {{ background: #303f9f; }}
- .delete {{ display: inline-block; margin-top: 8px; padding: 5px 12px; font-size: 12px;
-   background: #fff; color: #b3261e; border: 1px solid #b3261e; border-radius: 6px;
-   cursor: pointer; }}
- .delete:hover {{ background: #b3261e; color: #fff; }}
- .transcribe {{ display: inline-block; margin-top: 8px; padding: 5px 12px; font-size: 12px;
-   background: #1a237e; color: #fff; border: none; border-radius: 6px; cursor: pointer; }}
- .transcribe:hover {{ background: #303f9f; }}
- .sess .actions {{ margin-left: auto; }}
- details.transcript {{ margin-top: 8px; font-size: 13px; color: #333; }}
- details.transcript pre {{ white-space: pre-wrap; word-break: break-word;
-   background: #fafafa; border: 1px solid #eee; border-radius: 4px;
-   padding: 8px; margin: 8px 0; }}
- audio {{ width: 100%; }}
- .sess {{ display: flex; gap: 16px; align-items: center; }}
- .sess .note {{ font-size: 13px; color: #555; min-width: 220px; }}
- .sess .note a {{ color: #1a237e; text-decoration: underline; }}
- h2 {{ font-size: 18px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }}
- .search {{ display: flex; gap: 12px; align-items: center; margin-bottom: 20px; }}
- .search input {{ flex: 1; max-width: 480px; padding: 10px 12px; font-size: 15px;
-   border: 1px solid #bbb; border-radius: 6px; }}
- .search #count {{ font-size: 13px; color: #666; }}
- .page[hidden] {{ display: none; }}
- details {{ margin-top: 8px; font-size: 13px; color: #333; }}
- details pre {{ white-space: pre-wrap; word-break: break-word; background: #fafafa;
-   border: 1px solid #eee; border-radius: 4px; padding: 8px; margin: 8px 0 0; }}
+ :root {{ --ink:#1a237e; --accent:#7c3aed; --bg:#f3f4f7; --card:#fff;
+    --muted:#6b7280; --line:#e5e7eb; --danger:#b3261e; }}
+ * {{ box-sizing: border-box; }}
+ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif; margin:0; background: var(--bg); color:#1f2937; line-height:1.55; }}
+ header {{ padding:34px 24px 46px; color:#fff;
+    background: linear-gradient(135deg, #1a237e 0%, #3949ab 48%, #7c3aed 100%); }}
+ header .inner {{ max-width:1080px; margin:0 auto; }}
+ header h1 {{ margin:0; font-size:26px; letter-spacing:-0.02em; }}
+ header h1 a {{ color:#fff; text-decoration:none; }}
+ header p {{ margin:6px 0 0; opacity:.92; font-size:14px; }}
+ main {{ max-width:1080px; margin:0 auto; padding:0 20px 56px; }}
+ .search {{ display:flex; gap:12px; align-items:center; margin:-22px auto 0; max-width:620px;
+    background: var(--card); border:1px solid var(--line); border-radius:14px;
+    padding:6px 8px 6px 16px; box-shadow:0 6px 20px rgba(30,41,59,.10);
+    position:relative; z-index:2; }}
+ .search input {{ flex:1; border:none; outline:none; font-size:15px; padding:8px 0;
+    background:transparent; color:#1f2937; }}
+ .search input::placeholder {{ color:var(--muted); }}
+ .search #count {{ font-size:12px; color:var(--accent); font-weight:600; white-space:nowrap;
+    background:#f1efff; border-radius:999px; padding:5px 11px; }}
+ h2 {{ font-size:16px; font-weight:700; margin:32px 0 14px; color:#111827;
+    display:flex; align-items:center; gap:10px; }}
+ h2 .bar {{ width:4px; height:18px; border-radius:3px; background:var(--accent); }}
+ h2 .n {{ color:var(--muted); font-weight:600; font-size:12px; background:#eceffd;
+    border-radius:999px; padding:3px 10px; }}
+ .grid {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(230px,1fr)); gap:22px;
+    margin-top:16px; }}
+ .card {{ background:var(--card); border:1px solid var(--line); border-radius:16px;
+    padding:18px; box-shadow:0 1px 2px rgba(30,41,59,.05);
+    transition: transform .16s ease, box-shadow .16s ease; }}
+ .card:hover {{ transform: translateY(-3px); box-shadow:0 14px 28px rgba(30,41,59,.12); }}
+ .page a.thumb {{ display:block; text-align:center; }}
+ .page img {{ width:100%; border-radius:10px; border:1px solid var(--line); }}
+ .page .id {{ font-size:13.5px; font-weight:650; color:#111827; margin-top:11px; }}
+ .page .meta {{ font-size:12px; color:var(--muted); margin-top:2px; }}
+ .page .actions, .sess .actions {{ display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }}
+ a.download, .transcribe, .delete {{ font:inherit; cursor:pointer; border:none;
+    border-radius:9px; padding:7px 13px; font-size:12px; font-weight:600;
+    text-decoration:none; display:inline-flex; align-items:center; }}
+ a.download, .transcribe {{ background:linear-gradient(135deg,var(--ink),var(--accent));
+    color:#fff; }}
+ a.download:hover, .transcribe:hover {{ filter:brightness(1.08); }}
+ .transcribe:disabled {{ opacity:.65; cursor:progress; }}
+ .delete {{ background:#fff; color:var(--danger); border:1px solid var(--danger); }}
+ .delete:hover {{ background:var(--danger); color:#fff; }}
+ details, details.transcript {{ margin-top:12px; font-size:13px; color:#374151;
+    border:1px solid var(--line); border-radius:10px; padding:0 12px; background:#fafbff; }}
+ details summary {{ cursor:pointer; font-weight:650; padding:8px 0; color:var(--ink);
+    user-select:none; }}
+ details pre, details.transcript pre {{ white-space:pre-wrap; word-break:break-word;
+    background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px;
+    margin:0 0 10px; }}
+ audio {{ width:100%; margin-top:4px; border-radius:9px; }}
+ .sess {{ display:flex; gap:18px; align-items:center; }}
+ .sess .note {{ flex:1; min-width:0; font-size:13px; color:#4b5563; }}
+ .sess .note b {{ font-size:14px; color:#111827; }}
+ .sess .note a {{ color:var(--ink); text-decoration:none; font-weight:600; }}
+ .sess .note a:hover {{ text-decoration:underline; }}
+ .sess audio {{ max-width:420px; }}
+ .sess .actions {{ margin-left:auto; margin-top:0; }}
+ .page[hidden] {{ display:none; }}
+ @media (max-width:680px) {{ header {{ padding:26px 18px 40px; }}
+   .sess {{ flex-direction:column; align-items:stretch; }}
+   .sess audio {{ max-width:100%; }} .sess .actions {{ margin-left:0; margin-top:10px; }} }}
 </style>
 </head><body>
-<header><h1><a href="/">Notebook</a></h1></header>
+<header><div class="inner">
+ <h1><a href="/">Notebook</a></h1>
+ <p>Livescribe Echo &mdash; notes &amp; recordings</p>
+</div></header>
 <main>
 <div class="search">
  <input id="q" type="search" placeholder="Search pages and transcriptions..." autocomplete="off">
  <span id="count"></span>
 </div>
-<h2>Pages ({n_pages})</h2>
+<h2><span class="bar"></span>Pages <span class="n">{n_pages}</span></h2>
 <div class="grid">
  {pages}
 </div>
-<h2>Recordings ({n_sessions})</h2>
+<h2><span class="bar"></span>Recordings <span class="n">{n_sessions}</span></h2>
 {sessions}
 </main>
 <script>{search_js}</script>
@@ -221,9 +252,11 @@ def build_index():
                           'data-id="%s">Transcribe</button>'
                           % html.escape(str(p["id"]), quote=True))
         cards.append(
-            '<div class="page" data-search="{search}"><a href="{svg}"><img src="{thumb}" '
-            'alt="{id}"><div class="id">{id} &middot; {strokes} strokes</div></a>'
-            '{download}{transcribe}{delete}{transcript}</div>'
+            '<div class="page" data-search="{search}"><a class="thumb" '
+            'href="{svg}"><img src="{thumb}" alt="{id}">'
+            '<div class="id">{id}</div><div class="meta">{strokes} strokes</div></a>'
+            '<div class="actions">{download}{transcribe}{delete}</div>'
+            '{transcript}</div>'
             .format(
                 search=html.escape(search, quote=True),
                 svg=html.escape(p["svg"], quote=True),
