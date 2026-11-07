@@ -8,3 +8,4 @@ pillow
 sentencepiece
 protobuf
 tiktoken
+imageio-ffmpeg  # static ffmpeg used by stt.py to decode .aac (no system ffmpeg)

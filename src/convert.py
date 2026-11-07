@@ -17,8 +17,10 @@ the previous run are skipped, and output for sources that no longer exist
 is pruned. Use --force to re-render everything.
 
 Usage:  ./src/convert.py [--ocr] [--ocr-engine auto|tesseract|trocr] [--force]
+                     [--stt] [--session <id>]
 """
 import argparse
+import atexit
 import glob
 import json
 import os
@@ -26,18 +28,64 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "vendor"))
 import parsestf
 import ocr
+import stt
 
 PAGE_W, PAGE_H = 4963, 6278  # STF "dot" units; page size used by stf2pdf
 GRID = 83                     # visible dot-grid spacing in STF units
 INK = (12, 22, 90)            # Livescribe ink blue
 
+RENDER_VERSION = 2          # bump to force re-render on next ./run (see main)
+PAGE_PADDING = 120          # STF units of margin around ink in each render
+MIN_CANVAS = 600            # minimum page size in STF units (~2 grid cells)
+
 STATE_PATH = os.path.join(ROOT, ".convert-state.json")
+LOCK_PATH = os.path.join(ROOT, ".convert.lock")
+
+
+# ---------------------------------------------------------------------------
+# run lock
+# ---------------------------------------------------------------------------
+
+def acquire_lock(wait=3.0):
+    """Create the convert lock file exclusively (O_CREAT | O_EXCL).
+
+    Returns True if this process took the lock. Returns False without
+    creating anything when ``ECHO_LOCK_HELD`` is set: serve.py sets that
+    before launching a reconcile ``convert`` while it already holds the
+    lock, so the child skips locking and can't deadlock against its parent.
+
+    Blocks/retries up to ``wait`` seconds; raises RuntimeError if the
+    lock stays held that long.
+    """
+    if os.environ.get("ECHO_LOCK_HELD"):
+        return False
+    deadline = time.time() + wait
+    while True:
+        try:
+            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            os.close(fd)
+            return True
+        except FileExistsError:
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    "Another convert is running (lock file: %s). "
+                    "Try again shortly." % LOCK_PATH)
+            time.sleep(0.1)
+
+
+def release_lock():
+    try:
+        os.remove(LOCK_PATH)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -109,22 +157,63 @@ def load_strokes(stf_path):
     return [s for s in sc.strokes if s]
 
 
-def dot_grid():
-    """Yield (cx, cy) grid points across the page."""
+def dot_grid(bounds=None):
+    """Yield (cx, cy, r) grid points across a page region.
+
+    Keeps the global GRID lattice so paper dots stay aligned with the
+    original page, but only walks the region in ``bounds``. The default
+    region is the full nominal page.
+    """
+    if bounds is None:
+        bounds = (0, 0, PAGE_W, PAGE_H)
+    minx, miny, maxx, maxy = bounds
     r = GRID * 0.06
-    for gy in range(0, PAGE_H + GRID, GRID):
-        for gx in range(0, PAGE_W + GRID, GRID):
+    startx = int(minx // GRID) * GRID
+    starty = int(miny // GRID) * GRID
+    for gy in range(starty, int(maxy) + 1, GRID):
+        for gx in range(startx, int(maxx) + 1, GRID):
             yield gx, gy, r
 
 
-def render_svg(strokes, path):
+def ink_bounds(strokes, padding=PAGE_PADDING, min_canvas=MIN_CANVAS):
+    """Bounds of the actual ink, padded, with a minimum canvas size.
+
+    Returns (minx, miny, maxx, maxy). An empty page falls back to the full
+    nominal page rectangle. The minimum canvas is enforced symmetrically
+    around the ink centre so a lone stroke (or a single dot) doesn't zoom
+    to fill the whole card.
+    """
+    pts = [p for s in strokes for p in s]
+    if not pts:
+        return (0, 0, PAGE_W, PAGE_H)
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    minx, maxx = min(xs) - padding, max(xs) + padding
+    miny, maxy = min(ys) - padding, max(ys) + padding
+    w = maxx - minx
+    h = maxy - miny
+    if w < min_canvas:
+        half, cx = min_canvas / 2.0, (minx + maxx) / 2.0
+        minx, maxx = cx - half, cx + half
+    if h < min_canvas:
+        half, cy = min_canvas / 2.0, (miny + maxy) / 2.0
+        miny, maxy = cy - half, cy + half
+    return (minx, miny, maxx, maxy)
+
+
+def render_svg(strokes, path, bounds=None):
+    if bounds is None:
+        bounds = ink_bounds(strokes)
+    minx, miny, maxx, maxy = bounds
+    w, h = maxx - minx, maxy - miny
     parts = []
-    parts.append('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d"'
-                 % (PAGE_W, PAGE_H))
+    parts.append('<svg xmlns="http://www.w3.org/2000/svg" viewBox="%.1f %.1f %.1f %.1f"'
+                 % (minx, miny, w, h))
     parts.append(' width="100%" height="100%">\n')
-    parts.append('<rect width="%d" height="%d" fill="#ffffff"/>\n' % (PAGE_W, PAGE_H))
+    parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="#ffffff"/>\n'
+                 % (minx, miny, w, h))
     parts.append('<g fill="#c9d4e8">\n')
-    for gx, gy, r in dot_grid():
+    for gx, gy, r in dot_grid(bounds):
         parts.append('<circle cx="%d" cy="%d" r="%.2f"/>\n' % (gx, gy, r))
     parts.append('</g>\n')
     parts.append('<g stroke="#%02x%02x%02x" fill="none" stroke-linecap="round" '
@@ -156,7 +245,7 @@ def render_png(strokes, png_path, width=320, grid=True, bounds=None):
     if grid:
         # dot grid
         ctx.set_source_rgb(0.79, 0.83, 0.91)
-        for gx, gy, r in dot_grid():
+        for gx, gy, r in dot_grid(bounds):
             ctx.arc(gx, gy, r, 0, 2 * 3.14159)
             ctx.fill()
     # ink
@@ -173,8 +262,10 @@ def render_png(strokes, png_path, width=320, grid=True, bounds=None):
     publish_png(surface, png_path)
 
 
-def render_thumb(strokes, png_path, size=320):
-    render_png(strokes, png_path, width=size, grid=True)
+def render_thumb(strokes, png_path, size=320, bounds=None):
+    if bounds is None:
+        bounds = ink_bounds(strokes)
+    render_png(strokes, png_path, width=size, grid=True, bounds=bounds)
 
 
 def stroke_bounds(stroke):
@@ -360,6 +451,7 @@ def file_sig(path):
 
 def load_state():
     state = {
+        "render_version": None,     # RENDER_VERSION of the last render
         "sources": {},          # src relpath -> {"mtime_ns", "size"}
         "page_entries": {},     # page_id -> last index entry written
         "session_entries": {},  # session_id -> {"urls","pages","notebook"}
@@ -385,6 +477,18 @@ def source_unchanged(state, src_rel):
         return False
 
 
+def _audio_sig(urls, out_dir):
+    """(url, mtime_ns, size) per output audio file, for STT reuse keys."""
+    out = []
+    for u in sorted(urls):
+        try:
+            st = os.stat(os.path.join(out_dir, u))
+            out.append((u, st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append((u, 0, 0))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -402,6 +506,12 @@ def main(argv=None):
                     help="Tesseract page segmentation mode (default: 6)")
     ap.add_argument("--force", action="store_true",
                     help="re-render everything, ignoring the incremental state")
+    ap.add_argument("--stt", action="store_true",
+                    help="transcribe session audio (Moonshine) into transcripts")
+    ap.add_argument("--session", default=None,
+                    help="with --stt, transcribe only this session id")
+    ap.add_argument("--page", default=None,
+                    help="only OCR/render this one page id; others are reused")
     args = ap.parse_args(argv)
 
     do_ocr = args.ocr
@@ -428,6 +538,17 @@ def main(argv=None):
 
     settings = [engine, args.ocr_lang, args.ocr_psm] if do_ocr else None
 
+    do_stt = args.stt
+    if do_stt and not stt.available():
+        print("warning: --stt requested but STT is not available (need the "
+              "project .venv with transformers + imageio-ffmpeg); skipping",
+              file=sys.stderr)
+        do_stt = False
+
+    if acquire_lock():
+        # released on process exit, so an early exception can't leak it
+        atexit.register(release_lock)
+
     data_dir = os.path.join(ROOT, "data")
     out_dir = os.path.join(ROOT, "output")
     pages_out = os.path.join(out_dir, "pages")
@@ -437,8 +558,16 @@ def main(argv=None):
 
     state = load_state()
     if args.force:
-        state = {"sources": {}, "page_entries": {}, "session_entries": {},
+        state = {"render_version": None, "sources": {}, "page_entries": {},
+                 "session_entries": {},
                  "ocr_settings": None}
+    elif state.get("render_version") != RENDER_VERSION:
+        # Renderer changed (e.g. ink-bounds clipping): ignore the sources
+        # signature cache so every page is re-rendered once, then go back to
+        # incremental. Keep page_entries (rect/svg/thumb paths are stable).
+        print("renderer changed (v%s -> v%s); re-rendering all pages"
+              % (state.get("render_version"), RENDER_VERSION))
+        state["sources"] = {}
 
     pages = []
     skipped_pages = 0
@@ -447,6 +576,18 @@ def main(argv=None):
         src_rel = os.path.relpath(stf, ROOT)
         sig = file_sig(stf)
         prev = state.get("page_entries", {}).get(page_id)
+        if args.page is not None and page_id != args.page:
+            # single-page mode (on-demand OCR): reuse other pages so
+            # index.json stays complete without re-touching them.
+            if prev is not None:
+                state["sources"][src_rel] = file_sig(stf)
+                pages.append(dict(prev))
+                skipped_pages += 1
+                print("page %s: unchanged, skipping" % page_id)
+                continue
+            this_ocr = False  # never encoded before; render below, no OCR
+        else:
+            this_ocr = do_ocr
         reuse = (not args.force) and \
             state.get("sources", {}).get(src_rel) == sig and prev is not None and \
             os.path.exists(os.path.join(pages_out, page_id, "page.svg")) and \
@@ -462,15 +603,17 @@ def main(argv=None):
         strokes = load_strokes(stf)
         page_dir = os.path.join(pages_out, page_id)
         os.makedirs(page_dir, exist_ok=True)
-        render_svg(strokes, os.path.join(page_dir, "page.svg"))
-        render_thumb(strokes, os.path.join(page_dir, "thumb.png"))
+        bounds = ink_bounds(strokes)
+        render_svg(strokes, os.path.join(page_dir, "page.svg"), bounds)
+        render_thumb(strokes, os.path.join(page_dir, "thumb.png"), bounds=bounds)
         entry = {
             "id": page_id,
             "strokes": len(strokes),
+            "bounds": [round(b, 1) for b in bounds],
             "svg": "pages/%s/page.svg" % page_id,
             "thumb": "pages/%s/thumb.png" % page_id,
         }
-        if do_ocr:
+        if this_ocr:
             try:
                 text, kept = ocr_page(strokes, page_dir, engine,
                                       args.ocr_lang, args.ocr_psm)
@@ -558,9 +701,18 @@ def main(argv=None):
             skipped_sessions += 1
             print("session %s: unchanged, skipping" % s["id"])
         state["sources"].update(sigs)
-        state["session_entries"][s["id"]] = {
+        entry = {
             "urls": s["urls"], "pages": s["pages"], "notebook": s["notebook"],
         }
+        # carry forward transcripts/stt markers from a previous run so a
+        # non-stt convert doesn't drop them; sessions rebuilt every run
+        if isinstance(prev, dict):
+            for k in ("stt", "stt_sig", "transcript"):
+                if prev.get(k) is not None:
+                    entry[k] = prev[k]
+                    if k == "transcript":
+                        s["transcript"] = prev[k]
+        state["session_entries"][s["id"]] = entry
         for u in s["urls"]:
             kept_audio.add(os.path.basename(u))
 
@@ -598,7 +750,56 @@ def main(argv=None):
             except OSError:
                 pass
 
+    # Speech-to-text: transcribe each session's audio incrementally.
+    if do_stt:
+        total = len(sessions) - (1 if args.session else 0)
+        done = 0
+        for s in sessions:
+            sid = s["id"]
+            if args.session and sid != args.session:
+                continue
+            urls = s.get("urls") or []
+            if not urls:
+                s["transcript"] = ""
+                continue
+            sig = _audio_sig(urls, out_dir)
+            prev = state.get("session_entries", {}).get(sid, {}) or {}
+            prev_stt = prev.get("stt") or {}
+            # JSON stores tuples as lists; normalize both sides before comparing
+            cur_sig = [list(t) for t in sig]
+            prev_sig = prev.get("stt_sig") or []
+            tx_path = os.path.join(audio_out, sid + ".txt")
+            if (not args.force) and prev_stt.get("done") and \
+                    prev_stt.get("model") == stt.MOONSHINE_MODEL and \
+                    prev_sig == cur_sig and os.path.exists(tx_path):
+                s["transcript"] = prev.get("transcript", "")
+                print("session %s: transcript unchanged, skipping" % sid)
+                continue
+            aac_paths = [os.path.join(out_dir, u) for u in urls]
+            audio = stt.seq_to_floats(aac_paths)
+            try:
+                text = stt.transcribe(audio)
+            except Exception as e:
+                print("warning: STT failed for %s: %s" % (sid, e),
+                      file=sys.stderr)
+                continue
+            s["transcript"] = text or ""
+            if text:
+                atomic_write(tx_path, text + "\n")
+            else:
+                try:
+                    os.remove(tx_path)
+                except OSError:
+                    pass
+            entry = state["session_entries"].setdefault(sid, {})
+            entry["stt"] = {"done": True, "model": stt.MOONSHINE_MODEL}
+            entry["stt_sig"] = sig
+            entry["transcript"] = s["transcript"]
+            done += 1
+            print("session %s: transcribed (%d/%d)" % (sid, done, total))
+
     state["ocr_settings"] = settings
+    state["render_version"] = RENDER_VERSION
     atomic_write(os.path.join(out_dir, "index.json"),
                  json.dumps({"pages": pages, "sessions": sessions}, indent=2))
     save_state(state)

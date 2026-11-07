@@ -1,12 +1,12 @@
 # Future features (not yet implemented)
 
-Written-up specs for the two planned features, gathered so they can be
+Written-up specs for the planned features, gathered so they can be
 implemented without re-deriving the research. Each section is written to
 be actionable: decisions are made, the file/line touchpoints are listed,
 and acceptance criteria are spelled out.
 
 The current milestone (all P0/P1/P2 bug fixes + the `./run` entry point)
-was completed first; these are the next two features.
+was completed first; these are the next features.
 
 ---
 
@@ -207,3 +207,94 @@ model; `MOONSHINE_MODEL` env var overrides, mirroring `ocr.py`'s
 - [ ] Second `./run stt` is a no-op for unchanged sessions.
 - [ ] A mangled/part AAC file yields a warning, not a crash.
 - [ ] `MOONSHINE_MODEL=...` override takes effect (hits HF cache dir).
+
+---
+
+## Feature C — Pages clipped to the fixed page rectangle (bug)
+
+**Goal.** Render each page to the bounds of its actual ink instead of the
+nominal Livescribe page rectangle, so notes written past the page edge are
+not cut off. The SVG and thumbnail should both be sized to the writing
+(plus a small padding), not to `PAGE_W × PAGE_H`.
+
+### Current state / root cause
+
+`src/convert.py` renders every page against a fixed rectangle:
+
+- `PAGE_W, PAGE_H = 4963, 6278` (`src/convert.py:38`).
+- `render_svg()` hardcodes `viewBox="0 0 4963 6278"` and a full-page
+  background rect (`src/convert.py:162-180`).
+- `render_thumb()` → `render_png()` defaults `bounds=(0, 0, PAGE_W, PAGE_H)`
+  (`src/convert.py:183-219`).
+- `dot_grid()` only walks the nominal page (`src/convert.py:154-159`).
+
+Any stroke outside that rectangle is clipped. This is real on the current
+pen data:
+
+| page | ink x range | ink y range | clipped? |
+|---|---|---|---|
+| `2193.1.47.79` | 1359 → **6249** | 1034 → 2015 | right edge (page max 4963) |
+| `2208.0.26.96` | 368 → 5176 | 898 → **6595** | right + bottom (page max 6278) |
+| `2208.0.30.37` | 5354 → 5532 | 6672 → **6958** | bottom |
+
+The pen is not losing the ink — the renderer is cropping it to a page size
+the writing exceeds.
+
+### Design
+
+1. **`ink_bounds(strokes, padding=...)`** (new helper near `stroke_bounds`,
+   `src/convert.py:222`): flatten all points and return
+   `(minx-pad, miny-pad, maxx+pad, maxy+pad)`. Empty page falls back to
+   `(0, 0, PAGE_W, PAGE_H)`. Padding ~`GRID` (83) or `120` STF units so
+   stroke caps/round joins are not flush against the edge.
+
+2. **Minimum canvas (decision: yes).** A page with a single dot would
+   otherwise zoom enormously. Enforce a minimum width/height (e.g. ~600
+   STF units, roughly 2 grid cells) by expanding the bounds symmetrically
+   around the ink centre. This keeps tiny marks readable without turning
+   them into giant blobs.
+
+3. **`dot_grid(bounds=None)`** (`src/convert.py:154`): iterate grid points
+   from `floor(minx/GRID)*GRID` to `maxx` (same for y), keeping the global
+   grid origin so the paper dots stay aligned with the original page.
+
+4. **`render_svg(strokes, path, bounds=None)`** (`src/convert.py:162`):
+   default `bounds = ink_bounds(strokes)`; use `viewBox="minx miny w h"`,
+   draw the background rect at those bounds, and draw the grid over those
+   bounds. Keep `width="100%" height="100%"` so the card scales it.
+
+5. **`render_thumb()`** (`src/convert.py:218`): compute `ink_bounds(strokes)`
+   and pass it to `render_png(..., bounds=bounds)`. `render_png` already
+   accepts `bounds`; make its grid loop use the same bounds.
+
+6. **Invalidate old renders.** Add `RENDER_VERSION = 2`, store it in
+   `.convert-state.json`, and include it in the `reuse` check at
+   `src/convert.py:496`. Without this, unchanged `.stf` files keep serving
+   the old clipped SVGs until someone runs `--force`; with it, the fix
+   applies on the next normal `./run` and then goes back to incremental.
+
+7. **Optional — OCR path.** The Tesseract whole-page path (`ocr_page`,
+   `src/convert.py:377`) also renders with full-page bounds, so off-page
+   ink is clipped before OCR. Passing `ink_bounds` there would improve
+   recognition. TrOCR is unaffected (it already crops per line via
+   `render_line_png`). If changed, bump the OCR settings/version so text is
+   regenerated.
+
+8. **Optional — index metadata.** Store
+   `"bounds": [minx, miny, maxx, maxy]` in each page entry for debugging;
+   harmless.
+
+`src/serve.py` needs no change: it already displays the SVG/thumbnail at
+`width: 100%`, so a tighter `viewBox` simply fills the card.
+
+### Acceptance checklist
+
+- [ ] Every page's SVG `viewBox` contains all stroke coordinates.
+- [ ] Thumbnails show the same ink as the SVG (no clipping).
+- [ ] `2193.1.47.79`, `2208.0.26.96`, and `2208.0.30.37` render fully.
+- [ ] A normal in-bounds page still looks like a page (grid + padding, not
+      a degenerate crop).
+- [ ] A plain `./run` (no `--force`) re-renders old pages once, then is
+      incremental again.
+- [ ] Empty/1-stroke pages don't produce absurd zoom (minimum canvas
+      guard).

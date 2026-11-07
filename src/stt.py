@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Speech-to-text transcription of Paper Replay recordings.
+
+Transcribe the pen's ``.aac`` recordings into text using the Moonshine
+family (``UsefulSensors/moonshine-base``) via ``transformers`` in the
+project's ``.venv``. Decoding uses the ffmpeg binary that ships with
+:mod:`imageio_ffmpeg` (no system ffmpeg needed).
+
+Everything heavy (torch, transformers, ffmpeg, the model) is imported
+lazily so the base pipeline still runs without any of it installed.
+
+Audio is expected as mono 16 kHz float32 samples (the pen's sampling is
+resampled to 16 kHz by ffmpeg). Long recordings are chunked into ~30 s
+windows with 1 s overlap, matching how the model was trained; chunk texts
+are stitched on word boundaries (no timestamps in v1).
+"""
+import os
+import subprocess
+import sys
+
+MOONSHINE_MODEL = os.environ.get(
+    "MOONSHINE_MODEL", "UsefulSensors/moonshine-base")
+SAMPLE_RATE = 16000
+CHUNK_S = 30
+STRIDE_S = 1
+MAX_NEW_TOKENS = 256
+
+_model = None
+
+
+def ffmpeg_exe():
+    """Path to a usable ffmpeg binary (from imageio-ffmpeg), or None."""
+    try:
+        import imageio_ffmpeg
+    except Exception:
+        return None
+    try:
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def available():
+    """True when we can both decode audio and run the ASR model."""
+    if ffmpeg_exe() is None:
+        return False
+    try:
+        import torch  # noqa: F401
+        import transformers  # noqa: F401
+        import numpy  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _load_model():
+    """Lazily load Moonshine (CPU, capped threads) and its processor."""
+    global _model
+    if _model is None:
+        import torch
+        from transformers import AutoProcessor, MoonshineForConditionalGeneration
+
+        torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
+        processor = AutoProcessor.from_pretrained(MOONSHINE_MODEL)
+        model = MoonshineForConditionalGeneration.from_pretrained(MOONSHINE_MODEL)
+        model.eval()
+        _model = (torch, processor, model)
+    return _model
+
+
+def _chunks(audio):
+    """Yield ~CHUNK_S windows with a small overlap from a float32 array."""
+    size = int(SAMPLE_RATE * CHUNK_S)
+    overlap = int(SAMPLE_RATE * STRIDE_S)
+    step = max(1, size - overlap)  # slide past the overlap each window
+    if len(audio) <= size:
+        yield audio
+        return
+    for start in range(0, max(1, len(audio) - size), step):
+        yield audio[start:start + size]
+    if (len(audio) - size) % step != 0:
+        yield audio[-size:]
+
+
+def _stitch(texts):
+    """Concatenate chunk texts, dropping duplicate words at boundaries."""
+    words = []
+    for text in texts:
+        for w in text.split():
+            if words and words[-1].lower() == w.lower():
+                continue
+            words.append(w)
+    return " ".join(words)
+
+
+def transcribe(audio):
+    """Transcribe a float32 16 kHz mono ``audio`` ndarray to text.
+
+    Empty/short audio returns "". Returns cleaned text without timestamps.
+    """
+    if audio is None or len(audio) < SAMPLE_RATE // 2:  # < 0.5 s of audio
+        return ""
+    torch, processor, model = _load_model()
+    texts = []
+    for chunk in _chunks(audio):
+        feats = processor(audio=chunk, sampling_rate=SAMPLE_RATE,
+                          return_tensors="pt")
+        with torch.no_grad():
+            ids = model.generate(
+                input_values=feats.input_values,
+                attention_mask=feats.attention_mask,
+                max_new_tokens=MAX_NEW_TOKENS,
+            )
+        text = processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+        if text:
+            texts.append(text)
+    return _stitch(texts)
+
+
+def seq_to_floats(paths):
+    """Decode one or more audio files into one concatenated float32 array.
+
+    Per-file failures are degraded to a warning and skipped, so a mangled
+    part never aborts the whole session.
+    """
+    import numpy as np
+
+    chunks = []
+    for p in paths:
+        try:
+            chunks.append(_decode_floats(p))
+        except Exception as e:
+            print("warning: could not decode %s: %s" % (p, e), file=sys.stderr)
+    if not chunks:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(chunks)
+
+
+def _decode_floats(path, samplerate=SAMPLE_RATE):
+    """Decode ``path`` to mono 16 kHz float32 samples via bundled ffmpeg."""
+    ff = ffmpeg_exe()
+    if not ff:
+        raise RuntimeError("ffmpeg unavailable; install imageio-ffmpeg")
+    proc = subprocess.run(
+        [ff, "-nostdin", "-hide_banner", "-loglevel", "error",
+         "-i", path, "-f", "f32le", "-ac", "1", "-ar", str(samplerate),
+         "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError("ffmpeg failed (%d): %s"
+                           % (proc.returncode,
+                              proc.stderr.decode("utf-8", "replace").strip()))
+    import numpy as np
+    return np.frombuffer(proc.stdout, dtype=np.float32)

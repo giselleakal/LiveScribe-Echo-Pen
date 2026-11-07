@@ -13,3 +13,6 @@ __pycache__/
 
 # incremental conversion state
 .convert-state.json
+
+# convert/serve run lock
+.convert.lock

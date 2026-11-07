@@ -9,6 +9,9 @@ No tests, no CI, no lint config — verification is running the pipeline.
 - `run` is the only entry point; don't invoke `src/*.py` or `vendor/dumpscribe` directly unless debugging:
   - `./run` — incremental convert + serve on http://127.0.0.1:8000 (foreground)
   - `./run convert` / `./run ocr` — render only (ocr forces the OCR pass)
+  - `./run stt` — transcribe session audio (Moonshine) explicitly; pass
+    `--session PRS-…` to do one recording. Never auto-runs; uses the pip
+    `imageio-ffmpeg` static binary (no system ffmpeg needed).
   - `./run sync` — pen download (+convert); needs the pen attached
   - Extra args go to `src/serve.py`: `./run serve --port 8010 --host 0.0.0.0`
 
