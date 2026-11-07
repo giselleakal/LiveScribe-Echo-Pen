@@ -10,6 +10,10 @@
 #   ./run sync serve    download from the pen, convert + serve in one go
 #   ./run convert       conversion only (OCR auto-detected)
 #   ./run ocr           re-run conversion and force the OCR pass
+#   ./run stt           transcribe session audio; pass --session PRS-… to
+#                        limit to one recording (never run automatically)
+#   ./run stt           transcribe session audio; pass --session PRS-… to
+#                        limit to one recording (never run automatically)
 #   ./run clean-pen     download the notebook, then delete it from the pen
 #                        (bulk, destructive; prompts for confirmation)
 #   ./run help          this message
@@ -106,6 +110,10 @@ case "$mode" in
     ocr)
         shift
         "$PYTHON" "$ROOT/src/convert.py" --ocr "$@"
+        ;;
+    stt)
+        shift
+        "$PYTHON" "$ROOT/src/convert.py" --stt "$@"
         ;;
     clean-pen)
         clean_pen

@@ -17,6 +17,7 @@ the previous run are skipped, and output for sources that no longer exist
 is pruned. Use --force to re-render everything.
 
 Usage:  ./src/convert.py [--ocr] [--ocr-engine auto|tesseract|trocr] [--force]
+                     [--stt] [--session <id>]
 """
 import argparse
 import atexit
@@ -34,6 +35,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "vendor"))
 import parsestf
 import ocr
+import stt
 
 PAGE_W, PAGE_H = 4963, 6278  # STF "dot" units; page size used by stf2pdf
 GRID = 83                     # visible dot-grid spacing in STF units
@@ -475,6 +477,18 @@ def source_unchanged(state, src_rel):
         return False
 
 
+def _audio_sig(urls, out_dir):
+    """(url, mtime_ns, size) per output audio file, for STT reuse keys."""
+    out = []
+    for u in sorted(urls):
+        try:
+            st = os.stat(os.path.join(out_dir, u))
+            out.append((u, st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append((u, 0, 0))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -492,6 +506,10 @@ def main(argv=None):
                     help="Tesseract page segmentation mode (default: 6)")
     ap.add_argument("--force", action="store_true",
                     help="re-render everything, ignoring the incremental state")
+    ap.add_argument("--stt", action="store_true",
+                    help="transcribe session audio (Moonshine) into transcripts")
+    ap.add_argument("--session", default=None,
+                    help="with --stt, transcribe only this session id")
     args = ap.parse_args(argv)
 
     do_ocr = args.ocr
@@ -517,6 +535,13 @@ def main(argv=None):
             print("OCR engine: %s" % engine)
 
     settings = [engine, args.ocr_lang, args.ocr_psm] if do_ocr else None
+
+    do_stt = args.stt
+    if do_stt and not stt.available():
+        print("warning: --stt requested but STT is not available (need the "
+              "project .venv with transformers + imageio-ffmpeg); skipping",
+              file=sys.stderr)
+        do_stt = False
 
     if acquire_lock():
         # released on process exit, so an early exception can't leak it
@@ -662,9 +687,18 @@ def main(argv=None):
             skipped_sessions += 1
             print("session %s: unchanged, skipping" % s["id"])
         state["sources"].update(sigs)
-        state["session_entries"][s["id"]] = {
+        entry = {
             "urls": s["urls"], "pages": s["pages"], "notebook": s["notebook"],
         }
+        # carry forward transcripts/stt markers from a previous run so a
+        # non-stt convert doesn't drop them; sessions rebuilt every run
+        if isinstance(prev, dict):
+            for k in ("stt", "stt_sig", "transcript"):
+                if prev.get(k) is not None:
+                    entry[k] = prev[k]
+                    if k == "transcript":
+                        s["transcript"] = prev[k]
+        state["session_entries"][s["id"]] = entry
         for u in s["urls"]:
             kept_audio.add(os.path.basename(u))
 
@@ -701,6 +735,54 @@ def main(argv=None):
                       % os.path.basename(f))
             except OSError:
                 pass
+
+    # Speech-to-text: transcribe each session's audio incrementally.
+    if do_stt:
+        total = len(sessions) - (1 if args.session else 0)
+        done = 0
+        for s in sessions:
+            sid = s["id"]
+            if args.session and sid != args.session:
+                continue
+            urls = s.get("urls") or []
+            if not urls:
+                s["transcript"] = ""
+                continue
+            sig = _audio_sig(urls, out_dir)
+            prev = state.get("session_entries", {}).get(sid, {}) or {}
+            prev_stt = prev.get("stt") or {}
+            # JSON stores tuples as lists; normalize both sides before comparing
+            cur_sig = [list(t) for t in sig]
+            prev_sig = prev.get("stt_sig") or []
+            tx_path = os.path.join(audio_out, sid + ".txt")
+            if (not args.force) and prev_stt.get("done") and \
+                    prev_stt.get("model") == stt.MOONSHINE_MODEL and \
+                    prev_sig == cur_sig and os.path.exists(tx_path):
+                s["transcript"] = prev.get("transcript", "")
+                print("session %s: transcript unchanged, skipping" % sid)
+                continue
+            aac_paths = [os.path.join(out_dir, u) for u in urls]
+            audio = stt.seq_to_floats(aac_paths)
+            try:
+                text = stt.transcribe(audio)
+            except Exception as e:
+                print("warning: STT failed for %s: %s" % (sid, e),
+                      file=sys.stderr)
+                continue
+            s["transcript"] = text or ""
+            if text:
+                atomic_write(tx_path, text + "\n")
+            else:
+                try:
+                    os.remove(tx_path)
+                except OSError:
+                    pass
+            entry = state["session_entries"].setdefault(sid, {})
+            entry["stt"] = {"done": True, "model": stt.MOONSHINE_MODEL}
+            entry["stt_sig"] = sig
+            entry["transcript"] = s["transcript"]
+            done += 1
+            print("session %s: transcribed (%d/%d)" % (sid, done, total))
 
     state["ocr_settings"] = settings
     state["render_version"] = RENDER_VERSION

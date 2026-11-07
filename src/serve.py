@@ -57,6 +57,10 @@ PAGE_TPL = """<!doctype html>
    cursor: pointer; }}
  .delete:hover {{ background: #b3261e; color: #fff; }}
  .sess .actions {{ margin-left: auto; }}
+ details.transcript {{ margin-top: 8px; font-size: 13px; color: #333; }}
+ details.transcript pre {{ white-space: pre-wrap; word-break: break-word;
+   background: #fafafa; border: 1px solid #eee; border-radius: 4px;
+   padding: 8px; margin: 8px 0; }}
  audio {{ width: 100%; }}
  .sess {{ display: flex; gap: 16px; align-items: center; }}
  .sess .note {{ font-size: 13px; color: #555; min-width: 220px; }}
@@ -95,7 +99,8 @@ SEARCH_JS = """
   var q = document.getElementById('q');
   var count = document.getElementById('count');
   if (!q) return;
-  var cards = Array.prototype.slice.call(document.querySelectorAll('.page'));
+  var cards = Array.prototype.slice.call(
+      document.querySelectorAll('.page, .sess'));
   function apply() {
     var term = q.value.trim().toLowerCase();
     var shown = 0;
@@ -105,7 +110,7 @@ SEARCH_JS = """
       card.hidden = !match;
       if (match) shown++;
     });
-    count.textContent = term ? shown + ' of ' + cards.length + ' pages' : '';
+    count.textContent = term ? shown + ' of ' + cards.length + ' matches' : '';
   }
   q.addEventListener('input', apply);
   apply();
@@ -212,10 +217,31 @@ def build_index():
             note += '<br>Pages: <span class="pglinks">%s</span>' % links
         delete = ('<button class="delete" data-kind="session" data-id="%s">Delete</button>'
                   % html.escape(str(s.get("id", "")), quote=True))
+        transcript = (s.get("transcript") or "").strip()
+        tx_block = ""
+        tx_search = ""
+        if transcript:
+            tx_block = (
+                '<details class="transcript"><summary>Transcript</summary>'
+                '<pre>%s</pre></details>'
+                '<a class="download" href="%s" download>Download .txt</a>'
+                % (html.escape(transcript),
+                   html.escape("audio/%s.txt" % s.get("id", ""), quote=True))
+            )
+            tx_search = " " + transcript
+        search = ("%s %s%s"
+                  % (s.get("id", ""), s.get("notebook", ""), tx_search)).lower()
         sesses.append(
-            '<div class="card sess"><div class="note">%s</div>%s'
-            '<div class="actions">%s</div></div>'
-            % (note, players, delete)
+            '<div class="card sess" data-search="{search}">'
+            '<div class="note">{note}</div>{players}'
+            '<div class="actions">{delete}</div>{tx}</div>'
+            .format(
+                search=html.escape(search, quote=True),
+                note=note,
+                players=players,
+                delete=delete,
+                tx=tx_block,
+            )
         )
     page = PAGE_TPL.format(
         n_pages=len(pages),
@@ -279,6 +305,10 @@ def delete_session(session_id):
             os.remove(f)
         except OSError:
             pass
+    try:
+        os.remove(os.path.join(OUT, "audio", session_id + ".txt"))
+    except OSError:
+        pass
     state = convert.load_state()
     state["session_entries"].pop(session_id, None)
     state["sources"] = {
