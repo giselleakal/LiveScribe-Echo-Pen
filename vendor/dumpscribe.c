@@ -520,11 +520,17 @@ int get_archive(obex_t *handle, char* object_name, const char* outfile, const ch
   }
   
 	buf = get_named_object(handle, object_name, &len);
+  if(!buf) {
+    fprintf(stderr, "Failed to retrieve object from pen: %s\n", object_name);
+    fclose(out);
+    return 1;
+  }
 
   written = fwrite(buf, len, 1, out);
   free(buf);
   if(!written) {
     fprintf(stderr, "Data could not be written to disk. Is your disk full?\n");
+    fclose(out);
     return 1;
   }
 
@@ -633,6 +639,10 @@ long long int get_pentime(obex_t* handle) {
   const xmlChar* xpathExpr = BAD_CAST "/xml/peninfo/time";
 
   peninfo = get_peninfo(handle, &len);
+  if(!peninfo) {
+    fprintf(stderr, "Failed to retrieve pen info.\n");
+    return -1;
+  }
 
   xmlInitParser();
 
@@ -701,7 +711,7 @@ int64_t get_time_offset(obex_t* handle) {
     return -1;
   }
 
-  systime = get_systemtime(handle);
+  systime = get_systemtime();
   if(systime < 0) {
     printf("failed to get system time: %lld\n", systime);
     return -1;
@@ -754,7 +764,9 @@ char* get_written_page_list(obex_t* handle, long long int start_time, uint32_t* 
 }
 
 // Download all written pages
-int get_all_written_pages(obex_t* handle, long long int start_time, const char* outdir, int delete_after_get) {
+int get_all_written_pages(obex_t* handle, long long int start_time,
+                          const char* outfile, const char* outdir,
+                          int delete_after_get) {
 
   uint32_t list_len;
   xmlDocPtr doc;
@@ -838,7 +850,7 @@ int get_all_written_pages(obex_t* handle, long long int start_time, const char* 
     }
     debug("found notebook guid %s now retrievieving notebook pages\n", val);
 
-    get_notebook_pages(handle, BAD_CAST val, start_time, "/tmp/dumpscribe_pages.zip", outdir, delete_after_get);
+    get_notebook_pages(handle, BAD_CAST val, start_time, outfile, outdir, delete_after_get);
 
     xmlFree(val);
   }
@@ -864,7 +876,9 @@ int main(int argc, char** argv) {
 
   uint16_t usb_product_id;
   struct libusb_device_handle* dev;
-  const char* audio_outfile = "/tmp/dumpscribe_audio.zip";
+  char tmpdir[32];  /* "/tmp/dumpscribe-XXXXXX" is 22 chars + NUL */
+  char audio_outfile[64];
+  char pages_outfile[64];
   int ret, opt, i;
   int extra_args = 0;
   char* output_dir;
@@ -911,6 +925,18 @@ int main(int argc, char** argv) {
     fprintf(stderr, "No smartpen found. Are you sure it's connected?\n");
     return 1;
   }
+
+  // Use a private, unpredictable temp directory instead of a fixed
+  // /tmp/dumpscribe_*.zip name. With a fixed name this tool (which often
+  // runs as root) would follow attacker-controlled symlinks placed in
+  // /tmp, and two instances would clobber each other.
+  snprintf(tmpdir, sizeof(tmpdir), "/tmp/dumpscribe-XXXXXX");
+  if(!mkdtemp(tmpdir)) {
+    fprintf(stderr, "Failed to create private temp dir: %s\n", strerror(errno));
+    return 1;
+  }
+  snprintf(audio_outfile, sizeof(audio_outfile), "%s/dumpscribe_audio.zip", tmpdir);
+  snprintf(pages_outfile, sizeof(pages_outfile), "%s/dumpscribe_pages.zip", tmpdir);
   
   usb_product_id = identify_smartpen(dev);
   if(!usb_product_id) {
@@ -933,7 +959,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  ret = get_all_written_pages(handle, 0, output_dir, clean_mode);
+  ret = get_all_written_pages(handle, 0, pages_outfile, output_dir, clean_mode);
   if(ret) {
     fprintf(stderr, "Failed to get list of written pages from smartpen.\n");
     return 1;
@@ -944,6 +970,10 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Failed to write time offset.\n");
     return 1;
   }
+
+  unlink(audio_outfile);
+  unlink(pages_outfile);
+  rmdir(tmpdir);
 
   return 0;
 }

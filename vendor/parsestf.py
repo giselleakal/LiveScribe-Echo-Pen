@@ -15,7 +15,11 @@ class BitReader(object):
         self.byte=0xff
         sank_bytes = 0
         while self.byte & ~0x98:
-            self.byte = ord(self.stream.read(1))
+            b = self.stream.read(1)
+            if b == b"":
+                raise EOFError("unexpected end of .stf stream while resyncing "
+                               "(file is truncated?)")
+            self.byte = ord(b)
             sank_bytes += 1
         if debug and sank_bytes > 1:
             print("resync: ate %d bytes" % (sank_bytes - 1))
@@ -168,7 +172,12 @@ class STFParser(object):
         br = self.br
 
         while True:
-            br.sync()
+            try:
+                br.sync()
+            except EOFError:
+                # stream ended without the 0x80 end-of-data sentinel
+                # (truncated file): treat as clean end instead of crashing
+                break
             header = br.get_bits(8)
 
             if header == 0x18:
@@ -219,8 +228,8 @@ class STFParser(object):
 
                     do_delta = True
                     if header > 0:
-                        len = br.get_bits()
-                        if len:
+                        absl = br.get_bits()
+                        if absl:
                             do_delta = False
                             x1 = br.get_bits(16)
                             y1 = br.get_bits(16)
@@ -255,7 +264,6 @@ class STFParser(object):
             except Exception as e:
                 print(e)
                 raise
-                continue
         pass
 
     def handle_stroke_end(self, time):

@@ -1,0 +1,7 @@
+# Core pipeline.
+#
+# The only non-stdlib dependency of the core pipeline is pycairo (used for
+# PNG thumbnails and OCR input images). Prefer the system package when
+# available; this venv is usually created with --system-site-packages:
+#   python3 -m venv --system-site-packages .venv
+pycairo

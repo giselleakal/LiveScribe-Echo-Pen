@@ -1,0 +1,10 @@
+# Handwriting OCR backend (TrOCR). Needs the project .venv:
+#   python3 -m venv --system-site-packages .venv
+#   .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   .venv/bin/pip install -r requirements.txt
+torch  # install the CPU wheel first, see comment above
+transformers
+pillow
+sentencepiece
+protobuf
+tiktoken
