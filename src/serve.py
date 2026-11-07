@@ -7,16 +7,31 @@ page that lists pages (SVG previews) and audio sessions from index.json.
 Usage:  ./src/serve.py [--port 8000] [--host 0.0.0.0]
 """
 import argparse
+import glob
 import html
 import json
 import http.server
 import os
+import re
+import shutil
+import subprocess
+import sys
 import urllib.parse
+
+# Core pipeline helpers (state load/save, the run lock). This imports only
+# stdlib + the vendored parsestf/ocr at module load; cairo and torch stay
+# lazy inside convert.py/ocr.py, so serving stays dependency-light.
+import convert
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 OUT = os.path.join(ROOT, "output")
 INDEX = os.path.join(OUT, "index.json")
+
+# Path-traversal-safe id shapes (reject / \ .. leading '.', NUL, unicode.)
+PAGE_ID_RE = re.compile(r"^\d+(\.\d+)*$")
+SESSION_ID_RE = re.compile(r"^PRS-[0-9a-fA-F]+$")
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 PAGE_TPL = """<!doctype html>
 <html><head>
@@ -37,6 +52,11 @@ PAGE_TPL = """<!doctype html>
    padding: 6px 10px; font-size: 13px; background: #1a237e; color: #fff;
    border-radius: 6px; }}
  .page a.download:hover {{ background: #303f9f; }}
+ .delete {{ display: inline-block; margin-top: 8px; padding: 5px 12px; font-size: 12px;
+   background: #fff; color: #b3261e; border: 1px solid #b3261e; border-radius: 6px;
+   cursor: pointer; }}
+ .delete:hover {{ background: #b3261e; color: #fff; }}
+ .sess .actions {{ margin-left: auto; }}
  audio {{ width: 100%; }}
  .sess {{ display: flex; gap: 16px; align-items: center; }}
  .sess .note {{ font-size: 13px; color: #555; min-width: 220px; }}
@@ -66,6 +86,7 @@ PAGE_TPL = """<!doctype html>
 {sessions}
 </main>
 <script>{search_js}</script>
+<script>{del_js}</script>
 </body></html>
 """
 
@@ -88,6 +109,33 @@ SEARCH_JS = """
   }
   q.addEventListener('input', apply);
   apply();
+})();
+"""
+
+DEL_JS = """
+(function () {
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('.delete') : null;
+    if (!btn) return;
+    e.preventDefault();
+    var kind = btn.getAttribute('data-kind');
+    var id = btn.getAttribute('data-id');
+    var what = kind === 'session' ? 'recording' : 'page';
+    if (!confirm('Delete this ' + what + ' (' + id + ')? This cannot be undone.')) return;
+    var req = fetch('/api/delete/' + kind, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id })
+    });
+    req.then(function (r) { return r.json(); }).then(function (res) {
+      if (res.ok) {
+        var card = btn.closest('.page') || btn.closest('.sess');
+        if (card) card.parentNode.removeChild(card);
+      } else {
+        alert(res.error || 'Delete failed.');
+      }
+    }).catch(function () { alert('Delete failed.'); });
+  });
 })();
 """
 
@@ -125,10 +173,12 @@ def build_index():
                     "pages/%s/text.txt" % p["id"], quote=True))
             )
         search = ("%s %s" % (p.get("id", ""), text)).lower()
+        delete = ('<button class="delete" data-kind="page" data-id="%s">Delete</button>'
+                  % html.escape(str(p["id"]), quote=True))
         cards.append(
             '<div class="page" data-search="{search}"><a href="{svg}"><img src="{thumb}" '
             'alt="{id}"><div class="id">{id} &middot; {strokes} strokes</div></a>'
-            '{download}{transcript}</div>'
+            '{download}{delete}{transcript}</div>'
             .format(
                 search=html.escape(search, quote=True),
                 svg=html.escape(p["svg"], quote=True),
@@ -136,6 +186,7 @@ def build_index():
                 id=html.escape(str(p["id"])),
                 strokes=p["strokes"],
                 download=download,
+                delete=delete,
                 transcript=transcript,
             )
         )
@@ -159,9 +210,12 @@ def build_index():
                     html.escape(str(pid)))
                 for pid in linked)
             note += '<br>Pages: <span class="pglinks">%s</span>' % links
+        delete = ('<button class="delete" data-kind="session" data-id="%s">Delete</button>'
+                  % html.escape(str(s.get("id", "")), quote=True))
         sesses.append(
-            '<div class="card sess"><div class="note">%s</div>%s</div>'
-            % (note, players)
+            '<div class="card sess"><div class="note">%s</div>%s'
+            '<div class="actions">%s</div></div>'
+            % (note, players, delete)
         )
     page = PAGE_TPL.format(
         n_pages=len(pages),
@@ -169,12 +223,78 @@ def build_index():
         pages="\n".join(cards),
         sessions="\n".join(sesses),
         search_js=SEARCH_JS,
+        del_js=DEL_JS,
     )
     _LAST_GOOD = page
     return page
 
 
 _LAST_GOOD = None
+
+
+# ---------------------------------------------------------------------------
+# delete API
+# ---------------------------------------------------------------------------
+
+def find_session_dirs(session_id):
+    """Return every raw pen session directory for ``session_id``."""
+    replay = os.path.join(ROOT, "data", "userdata")
+    return glob.glob(os.path.join(
+        replay, "*", "Paper Replay", "*", "*", "sessions", session_id))
+
+
+def _reconcile():
+    """Re-run convert so index.json, output pruning, and state stay correct.
+
+    Runs with ECHO_LOCK_HELD so the child skips locking (the caller holds
+    the run lock). Output is regenerated atomically, so a concurrent GET
+    never sees a torn file.
+    """
+    env = dict(os.environ)
+    env["ECHO_LOCK_HELD"] = "1"
+    subprocess.run(
+        [sys.executable, os.path.join(ROOT, "src", "convert.py")],
+        env=env, check=False)
+
+
+def delete_page(page_id):
+    """Remove a page everywhere: raw dump, output, and incremental state."""
+    shutil.rmtree(os.path.join(OUT, "pages", page_id), ignore_errors=True)
+    shutil.rmtree(os.path.join(ROOT, "data", "data", page_id),
+                  ignore_errors=True)
+    state = convert.load_state()
+    state["page_entries"].pop(page_id, None)
+    state["sources"] = {
+        k: v for k, v in state["sources"].items()
+        if not k.startswith("data/data/%s/" % page_id)}
+    convert.save_state(state)
+
+
+def delete_session(session_id):
+    """Remove a recording everywhere: raw session dir, output audio, state."""
+    for d in find_session_dirs(session_id):
+        shutil.rmtree(d, ignore_errors=True)
+    for f in glob.glob(os.path.join(OUT, "audio", session_id + ".*.aac")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    state = convert.load_state()
+    state["session_entries"].pop(session_id, None)
+    state["sources"] = {
+        k: v for k, v in state["sources"].items()
+        if ("/sessions/%s/" % session_id) not in k}
+    convert.save_state(state)
+
+
+def send_json(handler, status, payload):
+    body = json.dumps(payload).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -195,6 +315,77 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body)
         else:
             super().do_GET()
+
+    def do_POST(self):
+        if not self.path.startswith("/api/delete/"):
+            send_json(self, 404, {"ok": False, "error": "not found"})
+            return
+
+        # content-type must be JSON
+        if "application/json" not in self.headers.get("Content-Type", ""):
+            send_json(self, 400,
+                      {"ok": False, "error": "Content-Type must be "
+                                             "application/json"})
+            return
+        # same-origin guard against CSRF (Origin, when present, must be us)
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        if origin and origin not in ("http://" + host, "https://" + host,
+                                     "null"):
+            send_json(self, 403,
+                      {"ok": False, "error": "cross-origin request denied"})
+            return
+        # deletes are disabled on non-loopback hosts unless explicitly enabled
+        if self.server.server_address[0] not in LOOPBACK_HOSTS and \
+                not os.environ.get("ECHO_ALLOW_LAN_DELETES"):
+            send_json(self, 403, {"ok": False, "error":
+                                  "Deletes disabled on a network host. Set "
+                                  "ECHO_ALLOW_LAN_DELETES=1 to enable."})
+            return
+
+        kind = self.path[len("/api/delete/"):]
+        if kind not in ("page", "session"):
+            send_json(self, 404, {"ok": False, "error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            send_json(self, 400, {"ok": False, "error": "empty request body"})
+            return
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            ident = payload["id"]
+        except (ValueError, KeyError, IndexError) as e:
+            send_json(self, 400,
+                      {"ok": False, "error": "bad JSON body: %s" % e})
+            return
+
+        # validate the id strictly; rejects traversal, NUL, unicode tricks
+        valid = PAGE_ID_RE.match(ident) if kind == "page" \
+            else SESSION_ID_RE.match(ident)
+        if not valid:
+            send_json(self, 400,
+                      {"ok": False, "error": "invalid id format"})
+            return
+
+        did_lock = convert.acquire_lock(wait=10.0)
+        try:
+            try:
+                if kind == "page":
+                    delete_page(ident)
+                else:
+                    delete_session(ident)
+            except OSError as e:
+                send_json(self, 500,
+                          {"ok": False, "error": "delete failed: %s" % e})
+                return
+            _reconcile()
+        finally:
+            if did_lock:
+                convert.release_lock()
+        send_json(self, 200, {"ok": True})
 
 
 def main():

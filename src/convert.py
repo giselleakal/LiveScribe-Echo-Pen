@@ -19,6 +19,7 @@ is pruned. Use --force to re-render everything.
 Usage:  ./src/convert.py [--ocr] [--ocr-engine auto|tesseract|trocr] [--force]
 """
 import argparse
+import atexit
 import glob
 import json
 import os
@@ -26,6 +27,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -38,6 +40,46 @@ GRID = 83                     # visible dot-grid spacing in STF units
 INK = (12, 22, 90)            # Livescribe ink blue
 
 STATE_PATH = os.path.join(ROOT, ".convert-state.json")
+LOCK_PATH = os.path.join(ROOT, ".convert.lock")
+
+
+# ---------------------------------------------------------------------------
+# run lock
+# ---------------------------------------------------------------------------
+
+def acquire_lock(wait=3.0):
+    """Create the convert lock file exclusively (O_CREAT | O_EXCL).
+
+    Returns True if this process took the lock. Returns False without
+    creating anything when ``ECHO_LOCK_HELD`` is set: serve.py sets that
+    before launching a reconcile ``convert`` while it already holds the
+    lock, so the child skips locking and can't deadlock against its parent.
+
+    Blocks/retries up to ``wait`` seconds; raises RuntimeError if the
+    lock stays held that long.
+    """
+    if os.environ.get("ECHO_LOCK_HELD"):
+        return False
+    deadline = time.time() + wait
+    while True:
+        try:
+            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            os.close(fd)
+            return True
+        except FileExistsError:
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    "Another convert is running (lock file: %s). "
+                    "Try again shortly." % LOCK_PATH)
+            time.sleep(0.1)
+
+
+def release_lock():
+    try:
+        os.remove(LOCK_PATH)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +469,10 @@ def main(argv=None):
             print("OCR engine: %s" % engine)
 
     settings = [engine, args.ocr_lang, args.ocr_psm] if do_ocr else None
+
+    if acquire_lock():
+        # released on process exit, so an early exception can't leak it
+        atexit.register(release_lock)
 
     data_dir = os.path.join(ROOT, "data")
     out_dir = os.path.join(ROOT, "output")

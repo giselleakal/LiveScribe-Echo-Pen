@@ -10,6 +10,8 @@
 #   ./run sync serve    download from the pen, convert + serve in one go
 #   ./run convert       conversion only (OCR auto-detected)
 #   ./run ocr           re-run conversion and force the OCR pass
+#   ./run clean-pen     download the notebook, then delete it from the pen
+#                        (bulk, destructive; prompts for confirmation)
 #   ./run help          this message
 #
 # The pen only appears inside WSL after scripts/windows-connect.ps1 has
@@ -71,6 +73,26 @@ presetup() {
     sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
 }
 
+clean_pen() {
+    if [ ! -x "$ROOT/vendor/dumpscribe" ]; then
+        echo "Building dumpscribe..."
+        "$ROOT/scripts/build-dumpscribe.sh"
+    fi
+    if ! lsusb 2>/dev/null | grep -Eqi '1cfb:103[0-2]'; then
+        echo "ERROR: Livescribe pen not attached to WSL (expected 1cfb:1030/1031/1032)." >&2
+        exit 1
+    fi
+    read -r -p "Download the notebook, then DELETE it from the pen? [y/N] " ans
+    case "$ans" in
+        y|Y|yes|Yes) ;;
+        *) echo "Aborted."; exit 1 ;;
+    esac
+    echo "Downloading from pen and deleting from pen (runs as root)..."
+    sudo "$ROOT/vendor/dumpscribe" -c "$ROOT/data"
+    sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
+    convert_only
+}
+
 mode="${1:-}"
 case "$mode" in
     ""|serve)
@@ -84,6 +106,9 @@ case "$mode" in
     ocr)
         shift
         "$PYTHON" "$ROOT/src/convert.py" --ocr "$@"
+        ;;
+    clean-pen)
+        clean_pen
         ;;
     sync)
         shift
