@@ -7,7 +7,9 @@ The pen is detected via `usbipd` (USB/IP), bridged into WSL2, and its
 contents are pulled over OBEX with a small C tool (`dumpscribe`, vendored
 from the [CounterCultureLabs/dumpscribe](https://github.com/CounterCultureLabs/dumpscribe)
 project, MIT license). A Python pipeline renders each written page to SVG
-(+ PNG thumbnails) and a stdlib-only HTTP server publishes them.
+(+ PNG thumbnails), optionally transcribes pages with OCR (TrOCR for
+handwriting, Tesseract as a lightweight fallback), and a stdlib-only HTTP
+server publishes them with full-text page search.
 
 ## Quick start
 
@@ -18,16 +20,19 @@ If everything is already set up (see "Current machine state"):
 #    run scripts/windows-connect.ps1 in an ADMIN PowerShell on Windows,
 #    then confirm:  lsusb   ->  1cfb:1032 Livescribe Echo(TM) Smartpen
 
-# 2. download notes from the pen and render pages:
-./scripts/sync.sh
+# 2. download notes from the pen and render pages (+ OCR if installed):
+./run sync
 
 # 3. start the website (it serves output/ on port 8000):
-python3 src/serve.py --port 8000
-#    open http://localhost:8000
+./run
+#    open http://localhost:8000 and use the search box
 ```
 
-The server stays in the foreground; press Ctrl+C to stop. If you have
-unsynced notes, run step 2 again anytime and refresh the page.
+`./run` converts (incrementally — unchanged pages are skipped) and then
+serves the site in the foreground; press Ctrl+C to stop. Re-run
+`./run sync` anytime you have unsynced notes, then refresh the page;
+`./run convert` only renders, `./run ocr` forces the OCR pass again.
+Extra server options go after the command: `./run serve --port 8010`.
 
 ## Architecture
 
@@ -58,8 +63,12 @@ Everything on this machine is already installed and verified working:
 - The pen has been synced once: `data/` holds 7 written pages (.stf),
   Paper Replay audio, and page templates; `output/` holds rendered pages.
 - `python3-cairo` renderer deps are installed. Start the site with
-  `python3 src/serve.py --port 8000` (binds localhost by default; pass
-  `--host 0.0.0.0` to expose on the LAN).
+  `./run` (converts, then binds localhost:8000; pass
+  `./run serve --host 0.0.0.0` to expose on the LAN).
+- OCR is ready: `tesseract` 5.3.4 is available via
+  `~/.local/bin/tesseract`, and `.venv` has TrOCR (CPU PyTorch +
+  transformers) with the `trocr-base-handwritten` model cached in
+  `~/.cache/huggingface`. `./run` uses TrOCR automatically.
 
 ## First-time setup (one-time per machine)
 
@@ -75,6 +84,26 @@ Everything on this machine is already installed and verified working:
 3. **Build the pen client**:
    ```sh
    ./scripts/build-dumpscribe.sh
+   ```
+
+4. **Optional — install OCR** (for page transcriptions and search):
+
+   Tesseract is small but poor at cursive handwriting:
+   ```sh
+   sudo apt install tesseract-ocr
+   ```
+
+   For accurate handwriting, install the TrOCR backend in a project venv
+   (`--system-site-packages` keeps the system `pycairo`):
+   ```sh
+   python3 -m venv --system-site-packages .venv
+   .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+   .venv/bin/pip install -r requirements.txt
+   ```
+   The model downloads on first use (~1.3 GB). `./run` prefers the venv
+   automatically when it exists. To re-run just the conversion:
+   ```sh
+   .venv/bin/python src/convert.py --ocr
    ```
 
 ## Daily workflow
@@ -93,23 +122,62 @@ Everything on this machine is already installed and verified working:
 
 3. **Sync + render**:
    ```sh
-   ./scripts/sync.sh
+   ./run sync
    ```
 
 4. **Serve the site**:
    ```sh
-   python3 src/serve.py --port 8000
+   ./run
    # open http://localhost:8000
    ```
+   (or combine both: `./run sync serve`)
+
+## OCR and search
+
+OCR is optional. `--ocr-engine auto` (the default) prefers TrOCR when the
+project `.venv` provides it, then falls back to `tesseract`. Override with
+`--ocr-engine tesseract` or `--ocr-engine trocr`.
+
+- TrOCR groups ink strokes into text lines, renders each line to
+  `output/pages/<page_id>/ocr-line-N.png`, and recognizes it. Tesseract
+  instead renders the whole page to `ocr.png`. Either way, the result is
+  written to `output/pages/<page_id>/text.txt`.
+- Recognized text is stored under the page's `text` key in
+  `output/index.json`.
+- The web UI shows a "Transcription" disclosure and a "Download .txt"
+  button per page, plus a search box that filters pages by id or text.
+
+Handwriting accuracy varies; the TrOCR backend handles cursive much
+better than Tesseract. Use `--ocr-lang eng+deu` (etc.) with Tesseract to
+recognize other languages.
+
+## Incremental conversion and deletions
+
+`./run convert` keeps an incremental state file (`.convert-state.json`,
+gitignored): source files unchanged since the last run are skipped, and
+output whose source is gone from `data/` is pruned. Deleting a page
+directory or audio file from `data/` therefore makes it disappear from
+the site on the next convert.
+
+Note: the pen itself still re-downloads everything on `./run sync` (the
+vendored dumpscribe has no per-asset skip), so removing a page from
+`data/` only sticks until the next real pen sync re-adds it. Deleting
+assets from the pen hardware is a `dumpscribe -c` bulk operation for
+whole notebooks, not per page/session (see `future_features/` for where
+this is headed).
 
 ## Project layout
 
 ```
 data/      raw output of dumpscribe  (gitignored)
 output/    generated site content    (gitignored)
-scripts/   windows-connect.ps1, sync.sh, build-dumpscribe.sh
-src/       convert.py, serve.py      (project code)
+scripts/   windows-connect.ps1, build-dumpscribe.sh
+src/       convert.py, ocr.py, serve.py (project code)
 vendor/    dumpscribe.c + parsestf.py (MIT, from CounterCultureLabs)
+run        one-shot entry point: convert + serve (./run, ./run sync)
+requirements-core.txt / requirements.txt   core / OCR dep lists
+.venv/     optional TrOCR backend + CPU PyTorch (gitignored)
+future_features/   written specs for planned-but-not-built features
 ```
 
 ## Troubleshooting
@@ -119,7 +187,7 @@ vendor/    dumpscribe.c + parsestf.py (MIT, from CounterCultureLabs)
   (admin PowerShell). If the cable is unknown, try another data cable.
 - **`usbipd bind` fails with a USBPcap warning**: use `--force`
   (the script already does).
-- **`sudo` prompts in `sync.sh`**: that is expected — the pen client needs
+- **`sudo` prompts in `./run sync`**: that is expected — the pen client needs
   read/write access to `/dev/bus/usb`. The dataset is chowned back to you.
 - **Pencil lead icon / HID mouse moves**: harmless; the pen's low-level
   HID interface is unused by this pipeline.

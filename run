@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# ./run — single entry point for the Echo notebook pipeline.
+#
+#   ./run               sync-free start: convert + serve (default)
+#   ./run serve         same as above; extra args go to serve.py,
+#                        e.g. ./run serve --port 8010 --host 0.0.0.0
+#   ./run sync          full pen sync: build (if needed) -> download from
+#                        pen via dumpscribe -> convert. Then run ./run
+#                        (or ./run sync serve) to view.
+#   ./run sync serve    download from the pen, convert + serve in one go
+#   ./run convert       conversion only (OCR auto-detected)
+#   ./run ocr           re-run conversion and force the OCR pass
+#   ./run help          this message
+#
+# The pen only appears inside WSL after scripts/windows-connect.ps1 has
+# been run in an admin PowerShell on the Windows side (usbipd attach).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
+if [ -x "$ROOT/.venv/bin/python" ]; then
+    PYTHON="$ROOT/.venv/bin/python"
+else
+    PYTHON="$(command -v python3)"
+fi
+
+usage() {
+    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+convert_only() {
+    # OCR flags: probe for a usable engine and pass --ocr along.
+    local args=()
+    if \
+        PYTHONPATH="$ROOT/src" "$PYTHON" -c "import ocr, sys; sys.exit(0 if (ocr.trocr_available() or ocr.available()) else 1)" 2>/dev/null; then
+        args+=(--ocr)
+    else
+        echo "note: no OCR engine available; pages get no transcription." >&2
+        echo "      install tesseract-ocr, or build the .venv (see README)." >&2
+    fi
+    "$PYTHON" "$ROOT/src/convert.py" "${args[@]}" "$@"
+}
+
+serve() {
+    echo "Converting (incremental)..."
+    convert_only
+    echo "Serving on http://127.0.0.1:8000 ... (Ctrl+C to stop)"
+    exec "$PYTHON" "$ROOT/src/serve.py" "$@"
+}
+
+presetup() {
+    # 1. Confirm the pen is attached, with the exact Livescribe IDs.
+    if ! lsusb 2>/dev/null | grep -Eqi '1cfb:103[0-2]'; then
+        echo "ERROR: Livescribe pen not attached to WSL (expected 1cfb:1030/1031/1032 in lsusb)." >&2
+        echo "Run scripts/windows-connect.ps1 in an ADMIN PowerShell on Windows," >&2
+        echo "then confirm with: lsusb" >&2
+        exit 1
+    fi
+
+    # 2. Build the pen client if it is missing.
+    if [ ! -x "$ROOT/vendor/dumpscribe" ]; then
+        echo "Building dumpscribe..."
+        "$ROOT/scripts/build-dumpscribe.sh"
+    fi
+
+    # 3. Download from the pen (needs root for raw USB access) and hand
+    #    the dump back to this user.
+    echo "Syncing pen (runs as root to access the USB device)..."
+    sudo "$ROOT/vendor/dumpscribe" "$ROOT/data"
+    sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
+}
+
+mode="${1:-}"
+case "$mode" in
+    ""|serve)
+        [ $# -gt 0 ] && shift
+        serve "$@"
+        ;;
+    convert)
+        shift
+        convert_only "$@"
+        ;;
+    ocr)
+        shift
+        "$PYTHON" "$ROOT/src/convert.py" --ocr "$@"
+        ;;
+    sync)
+        shift
+        presetup
+        convert_only
+        # optional passthrough: ./run sync serve --port 9000
+        if [ $# -gt 0 ] && [ "${1:-}" = "serve" ]; then
+            shift
+            serve "$@"
+        fi
+        echo "Done. Start ./run to view the notebook at http://127.0.0.1:8000"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    -*)
+        serve "$@"
+        ;;
+    *)
+        echo "Unknown command: $mode" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

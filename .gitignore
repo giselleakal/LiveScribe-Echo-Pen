@@ -10,3 +10,6 @@ vendor/dumpscribe
 __pycache__/
 *.pyc
 .venv/
+
+# incremental conversion state
+.convert-state.json
