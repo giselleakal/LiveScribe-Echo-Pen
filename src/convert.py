@@ -39,6 +39,10 @@ PAGE_W, PAGE_H = 4963, 6278  # STF "dot" units; page size used by stf2pdf
 GRID = 83                     # visible dot-grid spacing in STF units
 INK = (12, 22, 90)            # Livescribe ink blue
 
+RENDER_VERSION = 2          # bump to force re-render on next ./run (see main)
+PAGE_PADDING = 120          # STF units of margin around ink in each render
+MIN_CANVAS = 600            # minimum page size in STF units (~2 grid cells)
+
 STATE_PATH = os.path.join(ROOT, ".convert-state.json")
 LOCK_PATH = os.path.join(ROOT, ".convert.lock")
 
@@ -151,22 +155,63 @@ def load_strokes(stf_path):
     return [s for s in sc.strokes if s]
 
 
-def dot_grid():
-    """Yield (cx, cy) grid points across the page."""
+def dot_grid(bounds=None):
+    """Yield (cx, cy, r) grid points across a page region.
+
+    Keeps the global GRID lattice so paper dots stay aligned with the
+    original page, but only walks the region in ``bounds``. The default
+    region is the full nominal page.
+    """
+    if bounds is None:
+        bounds = (0, 0, PAGE_W, PAGE_H)
+    minx, miny, maxx, maxy = bounds
     r = GRID * 0.06
-    for gy in range(0, PAGE_H + GRID, GRID):
-        for gx in range(0, PAGE_W + GRID, GRID):
+    startx = int(minx // GRID) * GRID
+    starty = int(miny // GRID) * GRID
+    for gy in range(starty, int(maxy) + 1, GRID):
+        for gx in range(startx, int(maxx) + 1, GRID):
             yield gx, gy, r
 
 
-def render_svg(strokes, path):
+def ink_bounds(strokes, padding=PAGE_PADDING, min_canvas=MIN_CANVAS):
+    """Bounds of the actual ink, padded, with a minimum canvas size.
+
+    Returns (minx, miny, maxx, maxy). An empty page falls back to the full
+    nominal page rectangle. The minimum canvas is enforced symmetrically
+    around the ink centre so a lone stroke (or a single dot) doesn't zoom
+    to fill the whole card.
+    """
+    pts = [p for s in strokes for p in s]
+    if not pts:
+        return (0, 0, PAGE_W, PAGE_H)
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    minx, maxx = min(xs) - padding, max(xs) + padding
+    miny, maxy = min(ys) - padding, max(ys) + padding
+    w = maxx - minx
+    h = maxy - miny
+    if w < min_canvas:
+        half, cx = min_canvas / 2.0, (minx + maxx) / 2.0
+        minx, maxx = cx - half, cx + half
+    if h < min_canvas:
+        half, cy = min_canvas / 2.0, (miny + maxy) / 2.0
+        miny, maxy = cy - half, cy + half
+    return (minx, miny, maxx, maxy)
+
+
+def render_svg(strokes, path, bounds=None):
+    if bounds is None:
+        bounds = ink_bounds(strokes)
+    minx, miny, maxx, maxy = bounds
+    w, h = maxx - minx, maxy - miny
     parts = []
-    parts.append('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d"'
-                 % (PAGE_W, PAGE_H))
+    parts.append('<svg xmlns="http://www.w3.org/2000/svg" viewBox="%.1f %.1f %.1f %.1f"'
+                 % (minx, miny, w, h))
     parts.append(' width="100%" height="100%">\n')
-    parts.append('<rect width="%d" height="%d" fill="#ffffff"/>\n' % (PAGE_W, PAGE_H))
+    parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="#ffffff"/>\n'
+                 % (minx, miny, w, h))
     parts.append('<g fill="#c9d4e8">\n')
-    for gx, gy, r in dot_grid():
+    for gx, gy, r in dot_grid(bounds):
         parts.append('<circle cx="%d" cy="%d" r="%.2f"/>\n' % (gx, gy, r))
     parts.append('</g>\n')
     parts.append('<g stroke="#%02x%02x%02x" fill="none" stroke-linecap="round" '
@@ -198,7 +243,7 @@ def render_png(strokes, png_path, width=320, grid=True, bounds=None):
     if grid:
         # dot grid
         ctx.set_source_rgb(0.79, 0.83, 0.91)
-        for gx, gy, r in dot_grid():
+        for gx, gy, r in dot_grid(bounds):
             ctx.arc(gx, gy, r, 0, 2 * 3.14159)
             ctx.fill()
     # ink
@@ -215,8 +260,10 @@ def render_png(strokes, png_path, width=320, grid=True, bounds=None):
     publish_png(surface, png_path)
 
 
-def render_thumb(strokes, png_path, size=320):
-    render_png(strokes, png_path, width=size, grid=True)
+def render_thumb(strokes, png_path, size=320, bounds=None):
+    if bounds is None:
+        bounds = ink_bounds(strokes)
+    render_png(strokes, png_path, width=size, grid=True, bounds=bounds)
 
 
 def stroke_bounds(stroke):
@@ -402,6 +449,7 @@ def file_sig(path):
 
 def load_state():
     state = {
+        "render_version": None,     # RENDER_VERSION of the last render
         "sources": {},          # src relpath -> {"mtime_ns", "size"}
         "page_entries": {},     # page_id -> last index entry written
         "session_entries": {},  # session_id -> {"urls","pages","notebook"}
@@ -483,8 +531,16 @@ def main(argv=None):
 
     state = load_state()
     if args.force:
-        state = {"sources": {}, "page_entries": {}, "session_entries": {},
+        state = {"render_version": None, "sources": {}, "page_entries": {},
+                 "session_entries": {},
                  "ocr_settings": None}
+    elif state.get("render_version") != RENDER_VERSION:
+        # Renderer changed (e.g. ink-bounds clipping): ignore the sources
+        # signature cache so every page is re-rendered once, then go back to
+        # incremental. Keep page_entries (rect/svg/thumb paths are stable).
+        print("renderer changed (v%s -> v%s); re-rendering all pages"
+              % (state.get("render_version"), RENDER_VERSION))
+        state["sources"] = {}
 
     pages = []
     skipped_pages = 0
@@ -508,11 +564,13 @@ def main(argv=None):
         strokes = load_strokes(stf)
         page_dir = os.path.join(pages_out, page_id)
         os.makedirs(page_dir, exist_ok=True)
-        render_svg(strokes, os.path.join(page_dir, "page.svg"))
-        render_thumb(strokes, os.path.join(page_dir, "thumb.png"))
+        bounds = ink_bounds(strokes)
+        render_svg(strokes, os.path.join(page_dir, "page.svg"), bounds)
+        render_thumb(strokes, os.path.join(page_dir, "thumb.png"), bounds=bounds)
         entry = {
             "id": page_id,
             "strokes": len(strokes),
+            "bounds": [round(b, 1) for b in bounds],
             "svg": "pages/%s/page.svg" % page_id,
             "thumb": "pages/%s/thumb.png" % page_id,
         }
@@ -645,6 +703,7 @@ def main(argv=None):
                 pass
 
     state["ocr_settings"] = settings
+    state["render_version"] = RENDER_VERSION
     atomic_write(os.path.join(out_dir, "index.json"),
                  json.dumps({"pages": pages, "sessions": sessions}, indent=2))
     save_state(state)
