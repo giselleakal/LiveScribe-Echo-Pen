@@ -50,8 +50,9 @@ STATE_PATH = os.path.join(ROOT, ".convert-state.json")
 # user-assigned friendly names for pen notebook guids; written by the
 # site's rename button, read here so index.json carries the alias
 NOTEBOOK_NAMES_PATH = os.path.join(ROOT, "notebook_names.json")
-# user-assigned titles for individual recordings (PRS- session ids)
-RECORDING_TITLES_PATH = os.path.join(ROOT, "recording_titles.json")
+# user-assigned titles for individual assets, keyed by id (PRS- session
+# ids and page ids never collide, so one file serves both)
+TITLES_PATH = os.path.join(ROOT, "titles.json")
 LOCK_PATH = os.path.join(ROOT, ".convert.lock")
 
 
@@ -455,10 +456,10 @@ def load_notebook_names():
     return {str(k): str(v) for k, v in data.items() if str(v).strip()}
 
 
-def load_recording_titles():
-    """Per-recording titles keyed by session id (recording_titles.json)."""
+def load_titles():
+    """User-assigned titles for assets, keyed by id (titles.json)."""
     try:
-        with open(RECORDING_TITLES_PATH, encoding="utf-8") as f:
+        with open(TITLES_PATH, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return {}
@@ -467,10 +468,19 @@ def load_recording_titles():
     return {str(k): str(v) for k, v in data.items() if str(v).strip()}
 
 
+def apply_title(entry, asset_id, titles):
+    """Set or clear entry["title"] for a reused (not re-rendered) entry."""
+    t = titles.get(asset_id)
+    if t:
+        entry["title"] = t
+    else:
+        entry.pop("title", None)
+
+
 def collect_sessions(data_dir):
     offset = pen_offset_ms(data_dir)
     names = load_notebook_names()
-    titles = load_recording_titles()
+    titles = load_titles()
     sessions = []
     replay_root = os.path.join(data_dir, "userdata")
     for pen in glob.glob(os.path.join(replay_root, "*", "Paper Replay", "*", "*")):
@@ -681,6 +691,7 @@ def main(argv=None):
     pages = []
     skipped_pages = 0
     offset = pen_offset_ms(data_dir)   # pen-epoch -> real-time conversion
+    titles = load_titles()
     for stf in sorted(glob.glob(os.path.join(data_dir, "data", "*", "*", "*.stf"))):
         page_id = os.path.basename(os.path.dirname(os.path.dirname(stf)))
         src_rel = os.path.relpath(stf, ROOT)
@@ -691,7 +702,9 @@ def main(argv=None):
             # index.json stays complete without re-touching them.
             if prev is not None:
                 state["sources"][src_rel] = file_sig(stf)
-                pages.append(dict(prev))
+                entry = dict(prev)
+                apply_title(entry, page_id, titles)
+                pages.append(entry)
                 skipped_pages += 1
                 print("page %s: unchanged, skipping" % page_id)
                 continue
@@ -705,7 +718,10 @@ def main(argv=None):
              (state.get("ocr_settings") == settings and prev.get("ocr")))
         if reuse:
             state["sources"][src_rel] = sig
-            pages.append(dict(prev))
+            entry = dict(prev)
+            apply_title(entry, page_id, titles)
+            state["page_entries"][page_id] = entry
+            pages.append(entry)
             skipped_pages += 1
             print("page %s: unchanged, skipping" % page_id)
             continue
@@ -726,6 +742,9 @@ def main(argv=None):
         if offset is not None and tmin is not None:
             entry["captured"] = pen_ms_to_iso(tmin, offset)
             entry["captured_end"] = pen_ms_to_iso(tmax, offset)
+        title = titles.get(page_id)
+        if title:
+            entry["title"] = title
         if this_ocr:
             try:
                 text, kept = ocr_page(strokes, page_dir, engine,

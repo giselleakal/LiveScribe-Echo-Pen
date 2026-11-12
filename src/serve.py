@@ -127,6 +127,7 @@ PAGE_TPL = """<!doctype html>
  .sess-head .note .stamp {{ font-weight:600; color:#111827; }}
  .sess-head .note .rtitle {{ font-weight:650; color:#111827; }}
  .sess-head .note .sid {{ color:var(--muted); font-size:12px; }}
+ .page .id .psid {{ color:var(--muted); font-size:11px; font-weight:500; }}
  .rename, .titleedit {{ background:none; border:none; cursor:pointer; padding:0 2px 0 6px;
     font:inherit; font-size:12px; color:var(--muted); opacity:.55; }}
  .rename:hover, .titleedit:hover {{ opacity:1; color:var(--accent); }}
@@ -271,9 +272,10 @@ TITLE_JS = """
     e.preventDefault();
     var id = btn.getAttribute('data-id');
     var cur = btn.getAttribute('data-cur') || '';
+    var what = /^PRS-/.test(id) ? 'recording' : 'page';
     var ask = cur
-      ? 'Change the title of recording ' + id + ' to:'
-      : 'Give recording ' + id + ' a title:';
+      ? 'Change the title of ' + what + ' ' + id + ' to:'
+      : 'Give ' + what + ' ' + id + ' a title:';
     var name = prompt(ask, cur);
     if (name === null) return;
     name = name.trim();
@@ -500,7 +502,17 @@ def build_index():
                     "pages/%s/text.txt" % p["id"], quote=True))
             )
         when = _fmt_when(p.get("captured"), p.get("captured_end"))
-        search = ("%s %s %s" % (p.get("id", ""), when, text)).lower()
+        title = str(p.get("title") or "")
+        pid_txt = html.escape(str(p["id"]))
+        title_btn = ('<button class="titleedit" data-id="%s" data-cur="%s" '
+                     'title="Title this page">&#9998;</button>'
+                     % (pid_txt, html.escape(title, quote=True)))
+        if title:
+            id_html = ('%s <span class="psid">(%s)</span>%s'
+                       % (html.escape(title), pid_txt, title_btn))
+        else:
+            id_html = pid_txt + title_btn
+        search = ("%s %s %s %s" % (p.get("id", ""), title, when, text)).lower()
         delete = ('<button class="delete" data-kind="page" data-id="%s">Delete</button>'
                   % html.escape(str(p["id"]), quote=True))
         push = ('<button class="push" data-kind="page" data-id="%s">Send to Hermes</button>'
@@ -515,7 +527,7 @@ def build_index():
             '<input type="checkbox" class="pickbox" data-kind="page" data-id="{id}"></label>'
             '<a class="thumb" '
             'href="{svg}"><img src="{thumb}" alt="{id}">'
-            '<div class="id">{id}</div>'
+            '<div class="id">{id_html}</div>'
             '<div class="meta">{when}{stroke_meta}</div></a>'
             '<div class="actions">{download}{transcribe}{delete}{push}</div>'
             '{transcript}</div>'
@@ -523,7 +535,8 @@ def build_index():
                 search=html.escape(search, quote=True),
                 svg=html.escape(p["svg"], quote=True),
                 thumb=html.escape(p["thumb"], quote=True),
-                id=html.escape(str(p["id"])),
+                id=pid_txt,
+                id_html=id_html,
                 when=(html.escape(when) + " &middot; ") if when else "",
                 stroke_meta=("%d strokes" % p["strokes"]),
                 download=download,
@@ -1006,11 +1019,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         send_json(self, 200, {"ok": True, "name": name})
 
     def _do_title(self):
-        """Assign a title to a single recording (PRS- session id).
+        """Assign a title to a single asset (page or recording).
 
-        Body: {"id": "PRS-…", "name": "Grocery list Nov 11"}. Stored in
-        the tracked recording_titles.json (atomic write), then a locked
-        convert rebuilds index.json. Send name:"" to clear the title.
+        Body: {"id": "<page id or PRS-…>", "name": "Field sketch"} — the
+        kind is inferred from the id format (both live in titles.json).
+        Atomic write, then a locked convert rebuilds index.json.
+        Send name:"" to clear the title.
         """
         guard = self._post_guards()
         if guard:
@@ -1027,21 +1041,23 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             send_json(self, 400,
                       {"ok": False, "error": "bad JSON body: %s" % e})
             return
-        if not SESSION_ID_RE.match(str(ident)):
-            send_json(self, 400, {"ok": False, "error": "invalid session id"})
+        ident = str(ident)
+        if not (SESSION_ID_RE.match(ident) or PAGE_ID_RE.match(ident)):
+            send_json(self, 400,
+                      {"ok": False, "error": "invalid page/session id"})
             return
         name = str(name).strip()
         if len(name) > 80:
             send_json(self, 400, {"ok": False,
                                   "error": "title too long (max 80 chars)"})
             return
-        titles = convert.load_recording_titles()
+        titles = convert.load_titles()
         if name:
-            titles[str(ident)] = name
+            titles[ident] = name
         else:
-            titles.pop(str(ident), None)
+            titles.pop(ident, None)
         try:
-            convert.atomic_write(convert.RECORDING_TITLES_PATH,
+            convert.atomic_write(convert.TITLES_PATH,
                                  json.dumps(titles, indent=2, sort_keys=True)
                                  + "\n")
         except OSError as e:

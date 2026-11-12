@@ -205,6 +205,7 @@ def page_content_sig(page):
     payload = {
         "id": page["id"], "text": page.get("text", ""),
         "captured": page.get("captured", ""),
+        "title": page.get("title", ""),
         "svg": _file_sig(svg),
     }
     hasher.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -214,7 +215,7 @@ def page_content_sig(page):
 def build_page_payload(page):
     out = {
         "note_id": str(page["id"]),
-        "title": "page %s" % page["id"],
+        "title": page.get("title") or ("page %s" % page["id"]),
         "recorded_at": recorded_at_iso(page.get("captured") or "") or
         recorded_at(_sane_mtime(_page_stf(page["id"]),
                                 os.path.join(PAGES_OUT, page["id"],
