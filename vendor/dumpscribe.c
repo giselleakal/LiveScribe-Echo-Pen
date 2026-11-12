@@ -863,12 +863,95 @@ int get_all_written_pages(obex_t* handle, long long int start_time,
   return 0;
 }
 
+// Retire (delete) every notebook from the pen without downloading anything.
+// Safe only after a successful full sync; run's clear-pen offer gates on the
+// [ECHO] audio download ok marker before invoking this. Reads the tiny
+// changelist to learn the notebook guids, then retires each notebook's
+// pages and audio.
+int retire_all_notebooks(obex_t* handle, long long int start_time) {
+  uint32_t list_len;
+  xmlDocPtr doc;
+  xmlXPathContextPtr xpathCtx;
+  xmlXPathObjectPtr xpathObj;
+  xmlNodeSetPtr nodes;
+  xmlChar* val;
+  int i, size;
+  uint32_t len;
+
+  printf("Retiring notebooks from pen (no download).\n");
+
+  const xmlChar* xpathExpr = BAD_CAST "/xml/changelist/lsp";
+
+  char* list = get_written_page_list(handle, start_time, &list_len);
+  if(!list) {
+    fprintf(stderr, "Failed to retrieve the list of written pages.\n");
+    return 1;
+  }
+
+  xmlInitParser();
+
+  doc = xmlParseMemory(list, list_len);
+  free(list);
+  if(!doc) {
+    fprintf(stderr, "Failed to parse list of written pages.\n");
+    xmlCleanupParser();
+    return 1;
+  }
+
+  xpathCtx = xmlXPathNewContext(doc);
+  if(!xpathCtx) {
+    fprintf(stderr, "Failed to create XPath context.\n");
+    xmlFreeDoc(doc);
+    xmlCleanupParser();
+    return 1;
+  }
+
+  xpathObj = xmlXPathEvalExpression(xpathExpr, xpathCtx);
+  if(!xpathObj) {
+    fprintf(stderr, "Failed to evaluate XPath expression.\n");
+    xmlXPathFreeContext(xpathCtx);
+    xmlFreeDoc(doc);
+    xmlCleanupParser();
+    return 1;
+  }
+
+  nodes = xpathObj->nodesetval;
+  size = nodes->nodeNr;
+
+  for(i = 0; i < size; ++i) {
+    if(nodes->nodeTab[i]->type != XML_ELEMENT_NODE) {
+      continue;
+    }
+
+    val = xmlGetProp(nodes->nodeTab[i], BAD_CAST "guid");
+    if(!val) {
+      continue;
+    }
+    debug("retiring notebook guid %s\n", val);
+
+    delete_notebook_pages(handle, (char*) val, &len);
+    delete_notebook_audio(handle, (char*) val, &len);
+
+    xmlFree(val);
+  }
+
+  xmlXPathFreeObject(xpathObj);
+  xmlXPathFreeContext(xpathCtx);
+  xmlFreeDoc(doc);
+  xmlCleanupParser();
+
+  return 0;
+}
+
 
 void usage(const char* cmd_name) {
-  printf("Usage: %s [-d] [-c] output_dir\n", cmd_name);
+  printf("Usage: %s [-d] [-c] [-r] output_dir\n", cmd_name);
   printf("\n");
   printf("  -d: Enable debug output.\n");
   printf("  -c: Delete files from pen after successful download.\n");
+  printf("  -r: Retire (wipe) all notebooks from the pen without\n");
+  printf("      downloading anything. Use only after a successful sync\n");
+  printf("      has backed everything up locally.\n");
   printf("\n");
 }
 
@@ -883,13 +966,14 @@ int main(int argc, char** argv) {
   int extra_args = 0;
   char* output_dir;
   int clean_mode = 0;
+  int retire_mode = 0;
   
   if(argc < 1) {
     usage("dumpscribe");
     return 1;
   }
 
-  while((opt = getopt(argc, argv, "hcd")) != -1) {
+  while((opt = getopt(argc, argv, "hcrd")) != -1) {
     switch (opt) {
       case 'h': 
         usage(argv[0]);
@@ -897,6 +981,9 @@ int main(int argc, char** argv) {
         break;
       case 'c':
         clean_mode = 1;
+        break;
+      case 'r':
+        retire_mode = 1;
         break;
       case 'd':
         debug_mode = 1;
@@ -953,10 +1040,28 @@ int main(int argc, char** argv) {
 
   printf("Connected to smartpen!\n");
 
+  if(retire_mode) {
+    ret = retire_all_notebooks(handle, 0);
+    if(ret) {
+      fprintf(stderr, "Failed to retire notebooks from the pen.\n");
+      unlink(audio_outfile);
+      unlink(pages_outfile);
+      rmdir(tmpdir);
+      return 1;
+    }
+    printf("Pen retired (no download performed).\n");
+    unlink(audio_outfile);
+    unlink(pages_outfile);
+    rmdir(tmpdir);
+    return 0;
+  }
+
   ret = get_audio(handle, 0, audio_outfile, output_dir);
   if(ret) {
-    fprintf(stderr, "Failed to download audio from smartpen.\n");
-    return 1;
+    fprintf(stderr, "WARNING: failed to download audio from smartpen (%d).\n"
+                    "Continuing with pages; run STT/sync again to retry audio.\n", ret);
+  } else {
+    printf("[ECHO] audio download ok\n");
   }
 
   ret = get_all_written_pages(handle, 0, pages_outfile, output_dir, clean_mode);

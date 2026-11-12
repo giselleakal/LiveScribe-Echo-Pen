@@ -12,6 +12,10 @@
 #   ./run ocr           OCR pages on demand
 #   ./run stt           transcribe session audio; pass --session PRS-… to
 #                        limit to one recording (never run automatically)
+#   ./run push          send notes to the Hermes echo-scribe webhook; pass
+#                        --page ID / --session ID to send one, --force to
+#                        re-send unchanged notes, --flush-only to drain the
+#                        queue. Requires ECHO_SCRIBE_SECRET to be set.
 #   ./run clean-pen     download the notebook, then delete it from the pen
 #                        (bulk, destructive; prompts for confirmation)
 #   ./run help          this message
@@ -23,6 +27,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+# Optional local secrets (gitignored). Never commit ./.env.
+# e.g. ECHO_SCRIBE_SECRET, ECHO_UTC_OFFSET, ECHO_TZ.
+if [ -f "$ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$ROOT/.env"
+    set +a
+fi
+
 if [ -x "$ROOT/.venv/bin/python" ]; then
     PYTHON="$ROOT/.venv/bin/python"
 else
@@ -30,7 +43,7 @@ else
 fi
 
 usage() {
-    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 convert_only() {
@@ -64,8 +77,48 @@ presetup() {
     # 3. Download from the pen (needs root for raw USB access) and hand
     #    the dump back to this user.
     echo "Syncing pen (runs as root to access the USB device)..."
-    sudo "$ROOT/vendor/dumpscribe" "$ROOT/data"
+    local logfile
+    logfile="$(mktemp)"
+    # shellcheck disable=SC2024
+    sudo "$ROOT/vendor/dumpscribe" "$ROOT/data" 2>&1 | tee "$logfile"
+    # The pipeline exit status is dumpscribe's (pipefail), so a hard
+    # failure still stops here; the "audio download ok" marker tells us
+    # whether audio made it (so a later pen-clear offer is safe).
+    ECHO_AUDIO_OK=0
+    if grep -q '\[ECHO\] audio download ok' "$logfile"; then
+        ECHO_AUDIO_OK=1
+    fi
+    rm -f "$logfile"
     sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
+}
+
+# Offer to clear the pen after a successful, fully-downloaded sync.
+# Only when BOTH pages and audio are safe on disk (ECHO_AUDIO_OK) do we
+# suggest retiring the pen; otherwise a clear could delete pen audio that
+# was never backed up. Retire-only (-r) does NOT re-download: the sync
+# just made a fresh backup, so it wipes the pen and leaves local data
+# exactly as curated (deletions via the web UI stay deleted).
+maybe_offer_clear_pen() {
+    [ "${ECHO_AUDIO_OK:-0}" -eq 1 ] || { echo "Not offering pen clear (audio didn't download — pen left as-is)."; return 0; }
+    while true; do
+        read -r -p "Sync complete. Pen audio + pages are saved locally. Clear them from the pen to free space? [y/N] " ans
+        case "$ans" in
+            y|Y|yes|Yes)
+                echo "Retiring pen (no re-download; local backup already safe). Ctrl+C to abort now..."
+                sudo "$ROOT/vendor/dumpscribe" -r "$ROOT/data"
+                sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
+                echo "Pen cleared."
+                break
+                ;;
+            n|N|no|No|"")
+                echo "Leaving the pen untouched."
+                break
+                ;;
+            *)
+                echo "Please answer y or N."
+                ;;
+        esac
+    done
 }
 
 clean_pen() {
@@ -106,6 +159,10 @@ case "$mode" in
         shift
         "$PYTHON" "$ROOT/src/convert.py" --stt "$@"
         ;;
+    push)
+        shift
+        "$PYTHON" "$ROOT/src/scribe.py" push "$@"
+        ;;
     clean-pen)
         clean_pen
         ;;
@@ -113,6 +170,7 @@ case "$mode" in
         shift
         presetup
         convert_only
+        maybe_offer_clear_pen
         # optional passthrough: ./run sync serve --port 9000
         if [ $# -gt 0 ] && [ "${1:-}" = "serve" ]; then
             shift
