@@ -125,9 +125,11 @@ PAGE_TPL = """<!doctype html>
  .sess-head .note a {{ color:var(--ink); text-decoration:none; font-weight:600; }}
  .sess-head .note a:hover {{ text-decoration:underline; }}
  .sess-head .note .stamp {{ font-weight:600; color:#111827; }}
- .rename {{ background:none; border:none; cursor:pointer; padding:0 2px 0 6px;
+ .sess-head .note .rtitle {{ font-weight:650; color:#111827; }}
+ .sess-head .note .sid {{ color:var(--muted); font-size:12px; }}
+ .rename, .titleedit {{ background:none; border:none; cursor:pointer; padding:0 2px 0 6px;
     font:inherit; font-size:12px; color:var(--muted); opacity:.55; }}
- .rename:hover {{ opacity:1; color:var(--accent); }}
+ .rename:hover, .titleedit:hover {{ opacity:1; color:var(--accent); }}
  .sess-head .actions {{ margin-left:auto; }}
  .players {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(250px,1fr));
     gap:8px; margin-top:12px; }}
@@ -174,6 +176,7 @@ PAGE_TPL = """<!doctype html>
 <script>{search_js}</script>
 <script>{del_js}</script>
 <script>{rename_js}</script>
+<script>{title_js}</script>
 <script>{sel_js}</script>
 <script>{transcribe_js}</script>
 <script>{push_js}</script>
@@ -256,6 +259,40 @@ RENAME_JS = """
         alert(res.error || 'Rename failed.');
       }
     }).catch(function () { alert('Rename failed.'); });
+  });
+})();
+"""
+
+TITLE_JS = """
+(function () {
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('.titleedit') : null;
+    if (!btn) return;
+    e.preventDefault();
+    var id = btn.getAttribute('data-id');
+    var cur = btn.getAttribute('data-cur') || '';
+    var ask = cur
+      ? 'Change the title of recording ' + id + ' to:'
+      : 'Give recording ' + id + ' a title:';
+    var name = prompt(ask, cur);
+    if (name === null) return;
+    name = name.trim();
+    if (!name && cur) {
+      if (!confirm('Clear the title?')) return;
+    }
+    if (!name && !cur) return;
+    var req = fetch('/api/title', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id, name: name })
+    });
+    req.then(function (r) { return r.json(); }).then(function (res) {
+      if (res.ok) {
+        window.location.reload();
+      } else {
+        alert(res.error || 'Title failed.');
+      }
+    }).catch(function () { alert('Title failed.'); });
   });
 })();
 """
@@ -514,7 +551,18 @@ def build_index():
             players = "".join(parts)
         parts = " (%d parts)" % len(urls) if len(urls) > 1 else ""
         when = _fmt_when(s.get("captured"), s.get("captured_end"))
-        note = html.escape(str(s.get("id", "")))
+        sid_txt = html.escape(str(s.get("id", "")))
+        title = str(s.get("title") or "")
+        title_btn = ('<button class="titleedit" data-id="%s" data-cur="%s" '
+                     'title="Title this recording">&#9998;</button>'
+                     % (sid_txt,
+                        html.escape(title, quote=True)))
+        if title:
+            note = ('<span class="rtitle">%s</span> <span class="sid">'
+                    '(recording %s)</span>%s'
+                    % (html.escape(title), sid_txt, title_btn))
+        else:
+            note = sid_txt + title_btn
         if when:
             note += " &middot; <span class=\"stamp\">" + html.escape(when) + "</span>"
         if s.get("notebook"):
@@ -549,8 +597,9 @@ def build_index():
                    html.escape("audio/%s.txt" % s.get("id", ""), quote=True))
             )
             tx_search = " " + transcript
-        search = ("%s %s %s %s%s"
-                  % (s.get("id", ""), when, s.get("notebook_name") or "",
+        search = ("%s %s %s %s %s%s"
+                  % (s.get("id", ""), title, when,
+                     s.get("notebook_name") or "",
                      s.get("notebook", ""), tx_search)).lower()
         transcribe = ""
         if not transcript:
@@ -583,6 +632,7 @@ def build_index():
         search_js=SEARCH_JS,
         del_js=DEL_JS,
         rename_js=RENAME_JS,
+        title_js=TITLE_JS,
         sel_js=SEL_JS,
         transcribe_js=TRANSCRIBE_JS,
         push_js=PUSH_JS,
@@ -848,6 +898,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._do_delete_batch()
         if self.path == "/api/rename":
             return self._do_rename()
+        if self.path == "/api/title":
+            return self._do_title()
         if not self.path.startswith("/api/delete/"):
             send_json(self, 404, {"ok": False, "error": "not found"})
             return
@@ -944,6 +996,57 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except OSError as e:
             send_json(self, 500,
                       {"ok": False, "error": "saving name failed: %s" % e})
+            return
+        did_lock = convert.acquire_lock(wait=10.0)
+        try:
+            _reconcile()
+        finally:
+            if did_lock:
+                convert.release_lock()
+        send_json(self, 200, {"ok": True, "name": name})
+
+    def _do_title(self):
+        """Assign a title to a single recording (PRS- session id).
+
+        Body: {"id": "PRS-…", "name": "Grocery list Nov 11"}. Stored in
+        the tracked recording_titles.json (atomic write), then a locked
+        convert rebuilds index.json. Send name:"" to clear the title.
+        """
+        guard = self._post_guards()
+        if guard:
+            send_json(self, 403, guard)
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            ident, name = payload["id"], payload["name"]
+        except (ValueError, KeyError, TypeError) as e:
+            send_json(self, 400,
+                      {"ok": False, "error": "bad JSON body: %s" % e})
+            return
+        if not SESSION_ID_RE.match(str(ident)):
+            send_json(self, 400, {"ok": False, "error": "invalid session id"})
+            return
+        name = str(name).strip()
+        if len(name) > 80:
+            send_json(self, 400, {"ok": False,
+                                  "error": "title too long (max 80 chars)"})
+            return
+        titles = convert.load_recording_titles()
+        if name:
+            titles[str(ident)] = name
+        else:
+            titles.pop(str(ident), None)
+        try:
+            convert.atomic_write(convert.RECORDING_TITLES_PATH,
+                                 json.dumps(titles, indent=2, sort_keys=True)
+                                 + "\n")
+        except OSError as e:
+            send_json(self, 500,
+                      {"ok": False, "error": "saving title failed: %s" % e})
             return
         did_lock = convert.acquire_lock(wait=10.0)
         try:

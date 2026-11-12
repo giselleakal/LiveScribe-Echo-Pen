@@ -54,7 +54,9 @@ No tests, no CI, no lint config — verification is running the pipeline.
   be wiped by a slip), on-demand transcription, and Hermes push. Notebook
   display names live in the tracked `notebook_names.json`
   (guid -> friendly name; edited via the site's ✎ rename button, which
-  POSTs to `/api/rename`). Mutating
+  POSTs to `/api/rename`), and per-recording titles in
+  `recording_titles.json` (PRS- id -> title, via the ✎ button's title
+  control and `/api/title`). Mutating
   APIs are loopback-only unless `ECHO_ALLOW_LAN_DELETES=1` and enforce a
   same-origin check. `src/convert.py` has the core logic; its only
   third-party dep is pycairo (OCR/STT deps are lazy imports in `src/ocr.py`

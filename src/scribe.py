@@ -252,6 +252,7 @@ def session_content_sig(session, pages_by_id):
     payload = {
         "id": session["id"], "transcription": session.get("transcript", ""),
         "captured": session.get("captured", ""),
+        "title": session.get("title", ""),
         "audio": audio, "svgs": svgs,
     }
     hasher.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -261,7 +262,7 @@ def session_content_sig(session, pages_by_id):
 def build_session_payload(session, pages_by_id):
     out = {
         "note_id": str(session["id"]),
-        "title": "recording %s" % session["id"],
+        "title": session.get("title") or ("recording %s" % session["id"]),
         "recorded_at": recorded_at_iso(session.get("captured") or "") or
         recorded_at(_sane_mtime(*[os.path.join(OUT, u)
                                   for u in session.get("urls", [])])),

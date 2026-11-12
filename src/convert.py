@@ -50,6 +50,8 @@ STATE_PATH = os.path.join(ROOT, ".convert-state.json")
 # user-assigned friendly names for pen notebook guids; written by the
 # site's rename button, read here so index.json carries the alias
 NOTEBOOK_NAMES_PATH = os.path.join(ROOT, "notebook_names.json")
+# user-assigned titles for individual recordings (PRS- session ids)
+RECORDING_TITLES_PATH = os.path.join(ROOT, "recording_titles.json")
 LOCK_PATH = os.path.join(ROOT, ".convert.lock")
 
 
@@ -453,9 +455,22 @@ def load_notebook_names():
     return {str(k): str(v) for k, v in data.items() if str(v).strip()}
 
 
+def load_recording_titles():
+    """Per-recording titles keyed by session id (recording_titles.json)."""
+    try:
+        with open(RECORDING_TITLES_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if str(v).strip()}
+
+
 def collect_sessions(data_dir):
     offset = pen_offset_ms(data_dir)
     names = load_notebook_names()
+    titles = load_recording_titles()
     sessions = []
     replay_root = os.path.join(data_dir, "userdata")
     for pen in glob.glob(os.path.join(replay_root, "*", "Paper Replay", "*", "*")):
@@ -483,6 +498,9 @@ def collect_sessions(data_dir):
             alias = names.get(notebook)
             if alias:
                 s["notebook_name"] = alias
+            title = titles.get(sid)
+            if title:
+                s["title"] = title
             sessions.append(s)
     # chronological order so the site lists recordings oldest-first
     sessions.sort(key=lambda s: (s.get("captured") or "9999", s["id"]))
