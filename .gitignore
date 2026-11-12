@@ -14,5 +14,15 @@ __pycache__/
 # incremental conversion state
 .convert-state.json
 
+# push-to-Hermes state (dedup / accepted notes)
+.push-state.json
+
+# local secrets / env overrides (never commit)
+.env
+.env.*
+
+# mock-receiver test artifacts
+test-inbox/
+
 # convert/serve run lock
 .convert.lock
