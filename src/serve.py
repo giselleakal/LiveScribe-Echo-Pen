@@ -7,6 +7,7 @@ page that lists pages (SVG previews) and audio sessions from index.json.
 Usage:  ./src/serve.py [--port 8000] [--host 0.0.0.0]
 """
 import argparse
+import datetime
 import glob
 import html
 import json
@@ -121,6 +122,7 @@ PAGE_TPL = """<!doctype html>
  .sess-head .note b {{ font-size:14px; color:#111827; }}
  .sess-head .note a {{ color:var(--ink); text-decoration:none; font-weight:600; }}
  .sess-head .note a:hover {{ text-decoration:underline; }}
+ .sess-head .note .stamp {{ font-weight:600; color:#111827; }}
  .sess-head .actions {{ margin-left:auto; }}
  .players {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(250px,1fr));
     gap:8px; margin-top:12px; }}
@@ -365,6 +367,33 @@ PUSH_JS = """
 """
 
 
+def _fmt_when(iso, iso_end=None):
+    """Human capture-time string from an index.json ISO timestamp.
+
+    e.g. "Nov 10, 2026, 10:16 AM", or with an end time on the same day:
+    "Nov 10, 2026, 10:16 - 10:34 AM". Empty string when missing/unparseable.
+    """
+    if not iso:
+        return ""
+    try:
+        dt = datetime.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return ""
+    start = re.sub(r" 0(\d)", r" \1", dt.strftime("%b %d, %Y, %I:%M %p"))
+    if not iso_end:
+        return start
+    try:
+        dt2 = datetime.datetime.strptime(iso_end, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return start
+    if dt.date() != dt2.date():
+        end = re.sub(r" 0(\d)", r" \1", dt2.strftime("%b %d, %Y, %I:%M %p"))
+        return "%s - %s" % (start, end)
+    # same day: abbreviate to just the clock range
+    ampm = dt2.strftime(" %p")
+    return "%s - %s%s" % (start, dt2.strftime("%I:%M").lstrip("0"), ampm)
+
+
 def build_index():
     """Build the index page.
 
@@ -397,7 +426,8 @@ def build_index():
                 .format(txt=html.escape(
                     "pages/%s/text.txt" % p["id"], quote=True))
             )
-        search = ("%s %s" % (p.get("id", ""), text)).lower()
+        when = _fmt_when(p.get("captured"), p.get("captured_end"))
+        search = ("%s %s %s" % (p.get("id", ""), when, text)).lower()
         delete = ('<button class="delete" data-kind="page" data-id="%s">Delete</button>'
                   % html.escape(str(p["id"]), quote=True))
         push = ('<button class="push" data-kind="page" data-id="%s">Send to Hermes</button>'
@@ -412,7 +442,8 @@ def build_index():
             '<input type="checkbox" class="pickbox" data-kind="page" data-id="{id}"></label>'
             '<a class="thumb" '
             'href="{svg}"><img src="{thumb}" alt="{id}">'
-            '<div class="id">{id}</div><div class="meta">{strokes} strokes</div></a>'
+            '<div class="id">{id}</div>'
+            '<div class="meta">{when}{stroke_meta}</div></a>'
             '<div class="actions">{download}{transcribe}{delete}{push}</div>'
             '{transcript}</div>'
             .format(
@@ -420,7 +451,8 @@ def build_index():
                 svg=html.escape(p["svg"], quote=True),
                 thumb=html.escape(p["thumb"], quote=True),
                 id=html.escape(str(p["id"])),
-                strokes=p["strokes"],
+                when=(html.escape(when) + " &middot; ") if when else "",
+                stroke_meta=("%d strokes" % p["strokes"]),
                 download=download,
                 transcribe=transcribe,
                 delete=delete,
@@ -445,7 +477,10 @@ def build_index():
                     % (i, html.escape(u, quote=True)))
             players = "".join(parts)
         parts = " (%d parts)" % len(urls) if len(urls) > 1 else ""
+        when = _fmt_when(s.get("captured"), s.get("captured_end"))
         note = html.escape(str(s.get("id", "")))
+        if when:
+            note += " &middot; <span class=\"stamp\">" + html.escape(when) + "</span>"
         if s.get("notebook"):
             note += " &middot; notebook " + html.escape(str(s["notebook"]))
         note += html.escape(parts)
@@ -473,8 +508,9 @@ def build_index():
                    html.escape("audio/%s.txt" % s.get("id", ""), quote=True))
             )
             tx_search = " " + transcript
-        search = ("%s %s%s"
-                  % (s.get("id", ""), s.get("notebook", ""), tx_search)).lower()
+        search = ("%s %s %s%s"
+                  % (s.get("id", ""), when, s.get("notebook", ""),
+                     tx_search)).lower()
         transcribe = ""
         if not transcript:
             transcribe = ('<button class="transcribe" data-kind="session" '

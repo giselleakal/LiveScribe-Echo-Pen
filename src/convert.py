@@ -21,6 +21,7 @@ Usage:  ./src/convert.py [--ocr] [--ocr-engine auto|tesseract|trocr] [--force]
 """
 import argparse
 import atexit
+import datetime
 import glob
 import json
 import os
@@ -41,7 +42,7 @@ PAGE_W, PAGE_H = 4963, 6278  # STF "dot" units; page size used by stf2pdf
 GRID = 83                     # visible dot-grid spacing in STF units
 INK = (12, 22, 90)            # Livescribe ink blue
 
-RENDER_VERSION = 2          # bump to force re-render on next ./run (see main)
+RENDER_VERSION = 3          # bump to force re-render on next ./run (see main)
 PAGE_PADDING = 120          # STF units of margin around ink in each render
 MIN_CANVAS = 600            # minimum page size in STF units (~2 grid cells)
 
@@ -141,9 +142,15 @@ class StrokeCollector(parsestf.STFParser):
         super().__init__(stream)
         self.strokes = []   # list of strokes; each a list of (x, y, force)
         self.cur = []
+        self.tmin = None    # earliest pen-time ms seen (capture start)
+        self.tmax = None    # latest pen-time ms seen (capture end)
 
     def handle_point(self, x, y, force, time):
         self.cur.append((x, y, force))
+        if self.tmin is None or time < self.tmin:
+            self.tmin = time
+        if self.tmax is None or time > self.tmax:
+            self.tmax = time
 
     def handle_stroke_end(self, time):
         self.strokes.append(self.cur)
@@ -151,10 +158,65 @@ class StrokeCollector(parsestf.STFParser):
 
 
 def load_strokes(stf_path):
+    """Parse a .stf into (strokes, tmin, tmax) with pen-time ms bounds."""
     with open(stf_path, "rb") as f:
         sc = StrokeCollector(f)
         sc.parse()
-    return [s for s in sc.strokes if s]
+    return [s for s in sc.strokes if s], sc.tmin, sc.tmax
+
+
+# ---------------------------------------------------------------------------
+# capture timestamps (pen time -> real time via data/time_offset)
+# ---------------------------------------------------------------------------
+
+def pen_offset_ms(data_dir):
+    """Milliseconds from the pen's internal epoch to real time.
+
+    dumpscribe computes systime - pentime at sync time and stores it in
+    data/time_offset. Pen-downloaded file mtimes are a 1980 zero-time
+    placeholder, so this is the only reliable way to date pen data.
+    """
+    try:
+        with open(os.path.join(data_dir, "time_offset")) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def pen_ms_to_iso(pen_ms, offset_ms):
+    """Real time of a pen-time ms value, as local ISO 8601 with offset."""
+    dt = datetime.datetime.fromtimestamp((pen_ms + offset_ms) / 1000.0,
+                                         datetime.timezone.utc)
+    return dt.astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def parse_session_info(path, session_id):
+    """Decode session.info (CA-BE v3 header).
+
+    Layout: magic 0xFACE, version, 7 zero bytes, then 5-byte big-endian
+    pen-ms fields: session start at offset 11 (the PRS id IS that start
+    time, which we use as a sanity check), end at offset 19; per audio
+    part start/end pairs follow after a length-prefixed name each.
+
+    Returns (start_ms, end_ms), or None when unparseable.
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    if len(raw) < 24 or raw[0:2] != b"\xfa\xce":
+        return None
+    start = int.from_bytes(raw[11:16], "big")
+    end = int.from_bytes(raw[19:24], "big")
+    try:
+        if start != int(session_id[4:], 16):
+            return None
+    except ValueError:
+        return None
+    if start <= 0 or end < start:
+        return None
+    return start, end
 
 
 def dot_grid(bounds=None):
@@ -377,6 +439,7 @@ def audio_part_key(path):
 
 
 def collect_sessions(data_dir):
+    offset = pen_offset_ms(data_dir)
     sessions = []
     replay_root = os.path.join(data_dir, "userdata")
     for pen in glob.glob(os.path.join(replay_root, "*", "Paper Replay", "*", "*")):
@@ -389,12 +452,21 @@ def collect_sessions(data_dir):
                 continue
             sp = os.path.join(sess, "session.pages")
             pages = parse_session_pages(sp) if os.path.exists(sp) else []
-            sessions.append({
+            s = {
                 "id": sid,
                 "notebook": notebook,
                 "audio": [os.path.relpath(p, data_dir) for p in aac_parts],
                 "pages": pages,
-            })
+            }
+            info = os.path.join(sess, "session.info")
+            if os.path.exists(info) and offset is not None:
+                times = parse_session_info(info, sid)
+                if times:
+                    s["captured"] = pen_ms_to_iso(times[0], offset)
+                    s["captured_end"] = pen_ms_to_iso(times[1], offset)
+            sessions.append(s)
+    # chronological order so the site lists recordings oldest-first
+    sessions.sort(key=lambda s: (s.get("captured") or "9999", s["id"]))
     return sessions
 
 
@@ -571,6 +643,7 @@ def main(argv=None):
 
     pages = []
     skipped_pages = 0
+    offset = pen_offset_ms(data_dir)   # pen-epoch -> real-time conversion
     for stf in sorted(glob.glob(os.path.join(data_dir, "data", "*", "*", "*.stf"))):
         page_id = os.path.basename(os.path.dirname(os.path.dirname(stf)))
         src_rel = os.path.relpath(stf, ROOT)
@@ -600,7 +673,7 @@ def main(argv=None):
             print("page %s: unchanged, skipping" % page_id)
             continue
 
-        strokes = load_strokes(stf)
+        strokes, tmin, tmax = load_strokes(stf)
         page_dir = os.path.join(pages_out, page_id)
         os.makedirs(page_dir, exist_ok=True)
         bounds = ink_bounds(strokes)
@@ -613,6 +686,9 @@ def main(argv=None):
             "svg": "pages/%s/page.svg" % page_id,
             "thumb": "pages/%s/thumb.png" % page_id,
         }
+        if offset is not None and tmin is not None:
+            entry["captured"] = pen_ms_to_iso(tmin, offset)
+            entry["captured_end"] = pen_ms_to_iso(tmax, offset)
         if this_ocr:
             try:
                 text, kept = ocr_page(strokes, page_dir, engine,
@@ -800,6 +876,10 @@ def main(argv=None):
 
     state["ocr_settings"] = settings
     state["render_version"] = RENDER_VERSION
+    # chronological order (oldest first) for both lists; assets without a
+    # capture time fall to the end
+    pages.sort(key=lambda p: (p.get("captured") or "9999", p["id"]))
+    sessions.sort(key=lambda s: (s.get("captured") or "9999", s["id"]))
     atomic_write(os.path.join(out_dir, "index.json"),
                  json.dumps({"pages": pages, "sessions": sessions}, indent=2))
     save_state(state)

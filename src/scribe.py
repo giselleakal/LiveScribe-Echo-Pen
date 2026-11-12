@@ -115,7 +115,8 @@ def load_index():
 
 
 # ---------------------------------------------------------------------------
-# recorded_at: source mtime rendered in the configured zone/offset
+# recorded_at: capture time when known, else a sane file mtime, rendered
+# in the configured zone/offset
 # ---------------------------------------------------------------------------
 
 def _parse_offset(s):
@@ -128,20 +129,38 @@ def _parse_offset(s):
         datetime.timedelta(hours=int(m.group(2)), minutes=int(m.group(3))) * sign)
 
 
-def recorded_at(mtime):
-    """ISO 8601 with a UTC offset, from a Unix mtime."""
-    dt = datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc)
+def _render_zone(dt):
+    """Render a datetime in ECHO_TZ / ECHO_UTC_OFFSET (UTC fallback)."""
     tz_name = os.environ.get("ECHO_TZ")
     off = os.environ.get("ECHO_UTC_OFFSET")
     if tz_name:
         try:
             from zoneinfo import ZoneInfo
-            dt = dt.astimezone(ZoneInfo(tz_name))
+            return dt.astimezone(ZoneInfo(tz_name))
         except Exception:
             pass
     elif off and _parse_offset(off):
-        dt = dt.astimezone(_parse_offset(off))
-    return dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+        return dt.astimezone(_parse_offset(off))
+    return dt
+
+
+def recorded_at(mtime):
+    """ISO 8601 with a UTC offset, from a Unix mtime."""
+    return _render_zone(datetime.datetime.fromtimestamp(
+        mtime, datetime.timezone.utc)).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def recorded_at_iso(iso):
+    """Same rendering, from a capture-time ISO string (index.json).
+
+    Returns None when the input is missing/unparseable so callers can
+    fall back to file mtimes.
+    """
+    try:
+        dt = datetime.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S%z")
+    except (TypeError, ValueError):
+        return None
+    return _render_zone(dt).strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 # ---------------------------------------------------------------------------
@@ -162,17 +181,22 @@ def _svg_markup(page_id):
         return None
 
 
-def _page_source_mtime(page_id):
-    stf = _page_stf(page_id)
-    if stf:
+def _sane_mtime(*paths):
+    """First path with a plausible mtime, else now.
+
+    Pen-downloaded files carry a 1980 zero-time placeholder mtime, so
+    anything before 1990 is treated as garbage and skipped.
+    """
+    for p in paths:
+        if not p:
+            continue
         try:
-            return os.stat(stf).st_mtime
+            m = os.stat(p).st_mtime
         except OSError:
-            pass
-    try:
-        return os.stat(os.path.join(PAGES_OUT, page_id, "page.svg")).st_mtime
-    except OSError:
-        return time.time()
+            continue
+        if m > 631152000:  # 1990-01-01
+            return m
+    return time.time()
 
 
 def page_content_sig(page):
@@ -180,6 +204,7 @@ def page_content_sig(page):
     hasher = hashlib.sha256()
     payload = {
         "id": page["id"], "text": page.get("text", ""),
+        "captured": page.get("captured", ""),
         "svg": _file_sig(svg),
     }
     hasher.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -190,7 +215,10 @@ def build_page_payload(page):
     out = {
         "note_id": str(page["id"]),
         "title": "page %s" % page["id"],
-        "recorded_at": recorded_at(_page_source_mtime(page["id"])),
+        "recorded_at": recorded_at_iso(page.get("captured") or "") or
+        recorded_at(_sane_mtime(_page_stf(page["id"]),
+                                os.path.join(PAGES_OUT, page["id"],
+                                             "page.svg"))),
     }
     if page.get("text"):
         out["text"] = page["text"]
@@ -213,16 +241,6 @@ def _session_audio_bytes(session):
     return b"".join(chunks)
 
 
-def _session_source_mtime(session):
-    newest = time.time()
-    for u in session.get("urls", []):
-        try:
-            newest = max(newest, os.stat(os.path.join(OUT, u)).st_mtime)
-        except OSError:
-            pass
-    return newest
-
-
 def session_content_sig(session, pages_by_id):
     hasher = hashlib.sha256()
     audio = [_file_sig(os.path.join(OUT, u)) for u in session.get("urls", [])]
@@ -233,6 +251,7 @@ def session_content_sig(session, pages_by_id):
             svgs.append(_file_sig(os.path.join(PAGES_OUT, pid, "page.svg")))
     payload = {
         "id": session["id"], "transcription": session.get("transcript", ""),
+        "captured": session.get("captured", ""),
         "audio": audio, "svgs": svgs,
     }
     hasher.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -243,7 +262,9 @@ def build_session_payload(session, pages_by_id):
     out = {
         "note_id": str(session["id"]),
         "title": "recording %s" % session["id"],
-        "recorded_at": recorded_at(_session_source_mtime(session)),
+        "recorded_at": recorded_at_iso(session.get("captured") or "") or
+        recorded_at(_sane_mtime(*[os.path.join(OUT, u)
+                                  for u in session.get("urls", [])])),
     }
     if session.get("transcript"):
         out["transcription"] = session["transcript"]
