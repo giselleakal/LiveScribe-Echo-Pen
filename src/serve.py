@@ -408,7 +408,7 @@ def build_index():
                           'data-id="%s">Transcribe</button>'
                           % html.escape(str(p["id"]), quote=True))
         cards.append(
-            '<div class="page" data-search="{search}"><label class="pick">'
+            '<div class="card page" data-search="{search}"><label class="pick">'
             '<input type="checkbox" class="pickbox" data-kind="page" data-id="{id}"></label>'
             '<a class="thumb" '
             'href="{svg}"><img src="{thumb}" alt="{id}">'
