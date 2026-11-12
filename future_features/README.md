@@ -210,6 +210,102 @@ model; `MOONSHINE_MODEL` env var overrides, mirroring `ocr.py`'s
 
 ---
 
+## Feature D — Send notes to Hermes (echo-scribe webhook)
+
+**Goal.** An export that pushes each note from the notebook to the user's
+Hermes agent via its **webhook adapter** (`http://host:8644/webhooks/echo-scribe`),
+using the documented **Generic V2 signing scheme**. Delivered from the CLI
+(`./run push`) and a per-card "Send to Hermes" button in the web UI, with
+rsync-style dedup, an on-disk durable queue, and chunking for oversized notes.
+
+### Why the webhook (not the API server)
+
+Hermes (Nous Research's self-hosted agent) exposes two inbound surfaces. The
+user's contract pins the **webhook adapter** (route `echo-scribe`, port 8644,
+HMAC V2), which is event-driven and fire-and-forget — right for an export
+that "just delivers a note". The OpenAI-compatible API server (`/v1/chat/...`)
+was scoped out because the contract dictates webhook semantics.
+
+### Contract (implement exactly; do not redesign)
+
+- **POST** `http://localhost:8644/webhooks/echo-scribe`; no bearer token.
+- **Signing (Generic V2):** `ts = unix seconds as str`; `sig = hex HMAC-SHA256`
+  of `f"{ts}.{body}"` keyed with the shared secret, where `body` is the exact
+  bytes sent (serialize first, sign those bytes). Headers:
+  `Content-Type: application/json`, `X-Webhook-Timestamp: <ts>`,
+  `X-Webhook-Signature-V2: <sig>`, optional `X-Request-ID` (uuid per logical
+  note; 1h dedupe).
+- **Secret:** read at runtime from `ECHO_SCRIBE_SECRET` env; never hardcode/
+  commit. Value on the Hermes machine lives at
+  `/opt/data/inbox/echo-scribe/WEBHOOK.md`.
+- **Payload** (one JSON object per finalized note, omit empty fields):
+  `note_id` (stable+unique per note), `title`, `recorded_at` (ISO 8601 with
+  the pen's local UTC offset), `text` (page OCR), `transcription` (session
+  transcript), `svg_pages` (raw SVG markup strings in order),
+  `audio_name`/`audio_base64` (raw `.aac`, no `data:` prefix; omit if none),
+  `assets[]` (future extras: `{"name", "text"|"base64"}`).
+- **Chunking:** serialized body > 600,000 chars → slice the exact serialized
+  string into ≤600k-char slices; send sequentially as
+  `{"__chunk": {"id": <note_id>, "index": <0-based>, "total": <n>, "data": <slice>}}`;
+  sign each slice separately; wait for each 200 before the next.
+- **Responses:** 200 = stored (do not parse status); 401 = surface config
+  error (signature/clock >300s skew), no blind retry; 413 = surface;
+  429 = retry after delay; 5xx/network/timeout = exponential backoff
+  (≥3 attempts) then park.
+- **Durability:** failed/offline uploads never block capture/transcription;
+  unsent notes queue on disk, flush in the background-ish, survive restart;
+  accepted `note_id`s are persisted so a restart does not re-upload; never
+  drop a note while the network is down.
+
+### Current state / design decisions
+
+- Repo assets: **pages** (`output/pages/<id>/page.svg` + OCR `text` in
+  `output/index.json`) and **sessions** (`output/audio/<id>.n.aac` + `transcript`).
+  One note each: page note (`note_id` = page id) and session note
+  (`note_id` = `PRS-…`). Audio stays `.aac` (the feel agent accepted `.aac`),
+  named `audio.aac`; multi-part sessions concatenate their `.aac` parts in
+  order.
+- `recorded_at` sourced from the pen data's file mtime, rendered in
+  `ECHO_TZ` (IANA) or `ECHO_UTC_OFFSET` (e.g. `-05:00`); fallback UTC.
+- Dedup mirrors the repo idiom (`.convert-state.json`/`file_sig`): a
+  `.push-state.json` records per `note_id` a content `sig` (sha256 over the
+  payload's metadata: text/transcription + svg/audio size+mtime). Unchanged +
+  accepted → skip; content changed → re-push; `--force` overrides.
+- Delivery runs synchronously on request, but a note that can't be delivered
+  is parked in `output/push-queue/` (atomic writes) and drained on the next
+  push / `./run push --flush-only`.
+
+### Files / touchpoints
+
+- `src/scribe.py` (new, stdlib-only): `sign_v2`, `recorded_at`,
+  `build_page_payload` / `build_session_payload`, `page_content_sig` /
+  `session_content_sig`, `post_body`, `send_payload` (chunking), queue
+  (`enqueue` / `flush_queue`), `push_targets` / `push_one`, CLI `main`.
+- `run`: new `push` command → `scribe.py push` (`--page|--session|--force|--flush-only`).
+- `serve.py`: `import scribe`; `.push` button CSS + `PUSH_JS` + per-card
+  "Send to Hermes" buttons (pages + sessions); `_do_push` handler routed under
+  `POST /api/push/<kind>` (content-type + same-origin guard, id validation,
+  `503` when `ECHO_SCRIBE_SECRET` unset).
+- `.gitignore`: `.push-state.json`, `test-inbox/`.
+- `scripts/test-push-receiver.py` (mock Hermes receiver: HMAC-verify, 1MB cap,
+  chunk reassembly, writes `<root>/<date>/<note_id>/{note.md,page-NN.svg,
+  audio.aac,manifest.json}`, dedup by dir) and `scripts/test-push-sender.py`
+  (acceptance driver).
+
+### Acceptance (all passing via the mock receiver)
+
+- [x] Signature unit test vs `secret "s" / ts 1700000000 / body {"a":1}` →
+      `ab7bd212…92a2` (also verified for the raw-bytes path).
+- [x] Small page note → 200; files under `<root>/<date>/<note_id>/` as
+      `note.md`, `page-01.svg`, `manifest.json`.
+- [x] ~3 MB note (forces chunking, 7 slices) → all slices 200; reassembled
+      `audio.aac` sha256 == source.
+- [x] Same `note_id` sent twice → one directory.
+- [x] Receiver offline → note parked on disk; flush drains it when reachable.
+- [x] Real status codes + `find` output captured in the test run.
+
+---
+
 ## Feature C — Pages clipped to the fixed page rectangle (bug)
 
 **Goal.** Render each page to the bounds of its actual ink instead of the

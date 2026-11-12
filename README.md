@@ -166,6 +166,41 @@ assets from the pen hardware is a `dumpscribe -c` bulk operation for
 whole notebooks, not per page/session (see `future_features/` for where
 this is headed).
 
+## Push notes to Hermes
+
+`./run push` sends your notes to your Hermes agent's webhook
+(`http://host:8644/webhooks/echo-scribe`), HMAC-signed with the Generic V2
+scheme. Each page and each recording is one note:
+
+- **page note** — `note_id` = page id, `svg_pages` = the rendered SVG, `text` = OCR.
+- **recording note** — `note_id` = `PRS-…`, `.aac` audio (`audio_base64`), `transcription`,
+  plus the linked pages' SVGs.
+
+```sh
+export ECHO_SCRIBE_SECRET="<secret from /opt/data/inbox/echo-scribe/WEBHOOK.md>"
+
+./run push                       # send every new/changed note
+./run push --page 2193.1.47.79   # send one page
+./run push --session PRS-5197a597
+./run push --force               # re-send even unchanged notes
+./run push --flush-only          # just drain any queued notes
+```
+
+Push is rsync-style: `.push-state.json` records a content signature per
+`note_id`, so notes you've already sent unchanged are skipped. Unreachable
+notes are parked on disk (`output/push-queue/`, gitignored) and re-sent on a
+later push; they never block conversion/transcription. Oversized notes are
+chunked under the webhook's 1 MB limit automatically.
+
+The web UI also has a "Send to Hermes" button on every page and recording
+card (same signing/dedup path). Config is via environment:
+
+| Variable | Use |
+|---|---|
+| `ECHO_SCRIBE_SECRET` | required HMAC signing secret |
+| `ECHO_SCRIBE_URL` | webhook URL (default `http://127.0.0.1:8644/webhooks/echo-scribe`) |
+| `ECHO_TZ` / `ECHO_UTC_OFFSET` | zone / offset used for `recorded_at` (fallback UTC) |
+
 ## Project layout
 
 ```
