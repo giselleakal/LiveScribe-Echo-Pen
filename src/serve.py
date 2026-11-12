@@ -278,9 +278,9 @@ SEL_JS = """
     if (items.length > 5) {
       // matches BULK_DELETE_LIMIT in serve.py: big selections need a
       // typed confirmation so the library can't be wiped by a slip
-      var typed = prompt('You selected ' + items.length + ' items.\n' +
-        'This permanently deletes them from the notebook AND the raw pen\n' +
-        'data — it cannot be undone.\n\nType DELETE (all caps) to proceed:');
+      var typed = prompt('You selected ' + items.length + ' items.\\n' +
+        'This permanently deletes them from the notebook AND the raw pen\\n' +
+        'data - it cannot be undone.\\n\\nType DELETE (all caps) to proceed:');
       if (typed !== 'DELETE') return;
       body.confirm = 'DELETE';
     } else if (!confirm('Delete ' + desc + '? This cannot be undone.')) {
