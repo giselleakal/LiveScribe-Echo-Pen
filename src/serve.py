@@ -33,6 +33,8 @@ INDEX = os.path.join(OUT, "index.json")
 # Path-traversal-safe id shapes (reject / \ .. leading '.', NUL, unicode.)
 PAGE_ID_RE = re.compile(r"^\d+(\.\d+)*$")
 SESSION_ID_RE = re.compile(r"^PRS-[0-9a-fA-F]+$")
+# pen notebook guid (hex, from the dump directory name) or legacy ids
+NOTEBOOK_ID_RE = re.compile(r"^(?:[0-9a-fA-F]{8,32}|0|251)$")
 # Batches larger than this require {"confirm": "DELETE"} in the request
 # body (and the UI asks the user to type DELETE first) — so a stray
 # "select all" + click can never wipe the whole library in one shot.
@@ -123,6 +125,9 @@ PAGE_TPL = """<!doctype html>
  .sess-head .note a {{ color:var(--ink); text-decoration:none; font-weight:600; }}
  .sess-head .note a:hover {{ text-decoration:underline; }}
  .sess-head .note .stamp {{ font-weight:600; color:#111827; }}
+ .rename {{ background:none; border:none; cursor:pointer; padding:0 2px 0 6px;
+    font:inherit; font-size:12px; color:var(--muted); opacity:.55; }}
+ .rename:hover {{ opacity:1; color:var(--accent); }}
  .sess-head .actions {{ margin-left:auto; }}
  .players {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(250px,1fr));
     gap:8px; margin-top:12px; }}
@@ -168,6 +173,7 @@ PAGE_TPL = """<!doctype html>
 </main>
 <script>{search_js}</script>
 <script>{del_js}</script>
+<script>{rename_js}</script>
 <script>{sel_js}</script>
 <script>{transcribe_js}</script>
 <script>{push_js}</script>
@@ -220,6 +226,36 @@ DEL_JS = """
         alert(res.error || 'Delete failed.');
       }
     }).catch(function () { alert('Delete failed.'); });
+  });
+})();
+"""
+
+RENAME_JS = """
+(function () {
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('.rename') : null;
+    if (!btn) return;
+    e.preventDefault();
+    var id = btn.getAttribute('data-nb');
+    var cur = btn.getAttribute('data-cur') || id;
+    var name = prompt('Rename notebook ' + cur + ' to:', cur);
+    if (name === null) return;
+    name = name.trim();
+    if (!name) {
+      if (!confirm('Clear the notebook name and show the raw id again?')) return;
+    }
+    var req = fetch('/api/rename', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id, name: name })
+    });
+    req.then(function (r) { return r.json(); }).then(function (res) {
+      if (res.ok) {
+        window.location.reload();
+      } else {
+        alert(res.error || 'Rename failed.');
+      }
+    }).catch(function () { alert('Rename failed.'); });
   });
 })();
 """
@@ -482,7 +518,12 @@ def build_index():
         if when:
             note += " &middot; <span class=\"stamp\">" + html.escape(when) + "</span>"
         if s.get("notebook"):
-            note += " &middot; notebook " + html.escape(str(s["notebook"]))
+            nb_raw = str(s["notebook"])
+            nb_disp = str(s.get("notebook_name") or nb_raw)
+            note += ' &middot; notebook %s<button class="rename" data-nb="%s" data-cur="%s" title="Rename this notebook">&#9998;</button>' % (
+                html.escape(nb_disp),
+                html.escape(nb_raw, quote=True),
+                html.escape(nb_disp, quote=True))
         note += html.escape(parts)
         linked = s.get("pages") or []
         if linked:
@@ -508,9 +549,9 @@ def build_index():
                    html.escape("audio/%s.txt" % s.get("id", ""), quote=True))
             )
             tx_search = " " + transcript
-        search = ("%s %s %s%s"
-                  % (s.get("id", ""), when, s.get("notebook", ""),
-                     tx_search)).lower()
+        search = ("%s %s %s %s%s"
+                  % (s.get("id", ""), when, s.get("notebook_name") or "",
+                     s.get("notebook", ""), tx_search)).lower()
         transcribe = ""
         if not transcript:
             transcribe = ('<button class="transcribe" data-kind="session" '
@@ -541,6 +582,7 @@ def build_index():
         sessions="\n".join(sesses),
         search_js=SEARCH_JS,
         del_js=DEL_JS,
+        rename_js=RENAME_JS,
         sel_js=SEL_JS,
         transcribe_js=TRANSCRIBE_JS,
         push_js=PUSH_JS,
@@ -804,6 +846,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._do_transcribe()
         if self.path == "/api/delete":
             return self._do_delete_batch()
+        if self.path == "/api/rename":
+            return self._do_rename()
         if not self.path.startswith("/api/delete/"):
             send_json(self, 404, {"ok": False, "error": "not found"})
             return
@@ -856,6 +900,58 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if did_lock:
                 convert.release_lock()
         send_json(self, 200, {"ok": True})
+
+    def _do_rename(self):
+        """Assign a friendly display name to a notebook guid.
+
+        Body: {"id": "<guid>", "name": "Field Notes"}. Stored in the
+        repo-root notebook_names.json (atomic write), then a locked
+        convert rebuilds index.json so every session card picks it up.
+        Send name:"" to clear the alias back to the raw guid.
+        """
+        guard = self._post_guards()
+        if guard:
+            send_json(self, 403, guard)
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            ident, name = payload["id"], payload["name"]
+        except (ValueError, KeyError, TypeError) as e:
+            send_json(self, 400,
+                      {"ok": False, "error": "bad JSON body: %s" % e})
+            return
+        if not NOTEBOOK_ID_RE.match(str(ident)):
+            send_json(self, 400, {"ok": False, "error": "invalid notebook id"})
+            return
+        name = str(name).strip()
+        if len(name) > 60:
+            send_json(self, 400, {"ok": False,
+                                  "error": "name too long (max 60 chars)"})
+            return
+        names = convert.load_notebook_names()
+        if name:
+            names[str(ident)] = name
+        else:
+            names.pop(str(ident), None)
+        try:
+            convert.atomic_write(convert.NOTEBOOK_NAMES_PATH,
+                                 json.dumps(names, indent=2, sort_keys=True)
+                                 + "\n")
+        except OSError as e:
+            send_json(self, 500,
+                      {"ok": False, "error": "saving name failed: %s" % e})
+            return
+        did_lock = convert.acquire_lock(wait=10.0)
+        try:
+            _reconcile()
+        finally:
+            if did_lock:
+                convert.release_lock()
+        send_json(self, 200, {"ok": True, "name": name})
 
     def _do_delete_batch(self):
         """Delete many pages/sessions in one locked, reconciled pass.

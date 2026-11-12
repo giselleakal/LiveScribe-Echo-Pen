@@ -51,7 +51,10 @@ No tests, no CI, no lint config — verification is running the pipeline.
 - `src/serve.py` is **stdlib-only**. It serves `output/` statically (GET)
   and exposes guarded POST APIs: per-asset and batch delete (batch > 5
   items requires a typed `{"confirm": "DELETE"}` guard so the library can't
-  be wiped by a slip), on-demand transcription, and Hermes push. Mutating
+  be wiped by a slip), on-demand transcription, and Hermes push. Notebook
+  display names live in the tracked `notebook_names.json`
+  (guid -> friendly name; edited via the site's ✎ rename button, which
+  POSTs to `/api/rename`). Mutating
   APIs are loopback-only unless `ECHO_ALLOW_LAN_DELETES=1` and enforce a
   same-origin check. `src/convert.py` has the core logic; its only
   third-party dep is pycairo (OCR/STT deps are lazy imports in `src/ocr.py`

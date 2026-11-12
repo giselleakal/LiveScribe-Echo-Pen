@@ -47,6 +47,9 @@ PAGE_PADDING = 120          # STF units of margin around ink in each render
 MIN_CANVAS = 600            # minimum page size in STF units (~2 grid cells)
 
 STATE_PATH = os.path.join(ROOT, ".convert-state.json")
+# user-assigned friendly names for pen notebook guids; written by the
+# site's rename button, read here so index.json carries the alias
+NOTEBOOK_NAMES_PATH = os.path.join(ROOT, "notebook_names.json")
 LOCK_PATH = os.path.join(ROOT, ".convert.lock")
 
 
@@ -438,8 +441,21 @@ def audio_part_key(path):
     return (int(m.group(1)) if m else -1, base)
 
 
+def load_notebook_names():
+    """Friendly display names for notebook guids (notebook_names.json)."""
+    try:
+        with open(NOTEBOOK_NAMES_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if str(v).strip()}
+
+
 def collect_sessions(data_dir):
     offset = pen_offset_ms(data_dir)
+    names = load_notebook_names()
     sessions = []
     replay_root = os.path.join(data_dir, "userdata")
     for pen in glob.glob(os.path.join(replay_root, "*", "Paper Replay", "*", "*")):
@@ -464,6 +480,9 @@ def collect_sessions(data_dir):
                 if times:
                     s["captured"] = pen_ms_to_iso(times[0], offset)
                     s["captured_end"] = pen_ms_to_iso(times[1], offset)
+            alias = names.get(notebook)
+            if alias:
+                s["notebook_name"] = alias
             sessions.append(s)
     # chronological order so the site lists recordings oldest-first
     sessions.sort(key=lambda s: (s.get("captured") or "9999", s["id"]))
