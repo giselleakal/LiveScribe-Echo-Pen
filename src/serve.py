@@ -22,6 +22,7 @@ import urllib.parse
 # stdlib + the vendored parsestf/ocr at module load; cairo and torch stay
 # lazy inside convert.py/ocr.py, so serving stays dependency-light.
 import convert
+import scribe
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -31,6 +32,10 @@ INDEX = os.path.join(OUT, "index.json")
 # Path-traversal-safe id shapes (reject / \ .. leading '.', NUL, unicode.)
 PAGE_ID_RE = re.compile(r"^\d+(\.\d+)*$")
 SESSION_ID_RE = re.compile(r"^PRS-[0-9a-fA-F]+$")
+# Batches larger than this require {"confirm": "DELETE"} in the request
+# body (and the UI asks the user to type DELETE first) — so a stray
+# "select all" + click can never wipe the whole library in one shot.
+BULK_DELETE_LIMIT = 5
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 PAGE_TPL = """<!doctype html>
@@ -78,7 +83,7 @@ PAGE_TPL = """<!doctype html>
  .page .id {{ font-size:13.5px; font-weight:650; color:#111827; margin-top:11px; }}
  .page .meta {{ font-size:12px; color:var(--muted); margin-top:2px; }}
  .page .actions, .sess .actions {{ display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }}
- a.download, .transcribe, .delete {{ font:inherit; cursor:pointer; border:none;
+ a.download, .transcribe, .delete, .push {{ font:inherit; cursor:pointer; border:none;
     border-radius:9px; padding:7px 13px; font-size:12px; font-weight:600;
     text-decoration:none; display:inline-flex; align-items:center; }}
  a.download, .transcribe {{ background:linear-gradient(135deg,var(--ink),var(--accent));
@@ -87,6 +92,21 @@ PAGE_TPL = """<!doctype html>
  .transcribe:disabled {{ opacity:.65; cursor:progress; }}
  .delete {{ background:#fff; color:var(--danger); border:1px solid var(--danger); }}
  .delete:hover {{ background:var(--danger); color:#fff; }}
+ .card {{ position:relative; }}
+ .pick {{ position:absolute; top:10px; left:10px; z-index:3; width:18px; height:18px;
+    cursor:pointer; accent-color:var(--accent); }}
+ .card.selected {{ box-shadow:0 0 0 2px var(--accent); }}
+ .selbar {{ display:flex; gap:10px; align-items:center; margin:16px 0 -4px;
+    flex-wrap:wrap; font-size:13px; }}
+ .selbar label {{ display:inline-flex; gap:6px; align-items:center; cursor:pointer;
+    font-weight:600; color:var(--ink); }}
+ .selbar .muted {{ background:#fff; border:1px solid var(--line); border-radius:9px;
+    padding:6px 12px; font:inherit; font-size:12px; font-weight:600; cursor:pointer;
+    color:var(--muted); }}
+ .selbar .delete:disabled {{ opacity:.5; cursor:not-allowed; }}
+ .push {{ background:linear-gradient(135deg,#047857,#0d9488); color:#fff; }}
+ .push:hover {{ filter:brightness(1.08); }}
+ .push:disabled {{ opacity:.65; cursor:progress; }}
  details, details.transcript {{ margin-top:12px; font-size:13px; color:#374151;
     border:1px solid var(--line); border-radius:10px; padding:0 12px; background:#fafbff; }}
  details summary {{ cursor:pointer; font-weight:650; padding:8px 0; color:var(--ink);
@@ -119,7 +139,7 @@ PAGE_TPL = """<!doctype html>
    .grid {{ grid-template-columns:1fr; gap:14px; }}
    .card {{ padding:14px; }}
    .page .actions, .sess-head .actions {{ flex-direction:column; align-items:stretch; }}
-   a.download, .transcribe, .delete {{ width:100%; justify-content:center; }}
+   a.download, .transcribe, .delete, .push {{ width:100%; justify-content:center; }}
    h2 {{ margin:24px 0 10px; }} }}
 </style>
 </head><body>
@@ -132,6 +152,11 @@ PAGE_TPL = """<!doctype html>
  <input id="q" type="search" placeholder="Search pages and transcriptions..." autocomplete="off">
  <span id="count"></span>
 </div>
+<div class="selbar">
+ <label><input type="checkbox" id="sel-all"> Select all shown</label>
+ <button class="muted" id="sel-clear">Clear</button>
+ <button class="delete" id="sel-del" disabled>Delete selected (<span id="sel-count">0</span>)</button>
+</div>
 <h2><span class="bar"></span>Pages <span class="n">{n_pages}</span></h2>
 <div class="grid">
  {pages}
@@ -141,7 +166,9 @@ PAGE_TPL = """<!doctype html>
 </main>
 <script>{search_js}</script>
 <script>{del_js}</script>
+<script>{sel_js}</script>
 <script>{transcribe_js}</script>
+<script>{push_js}</script>
 </body></html>
 """
 
@@ -195,6 +222,88 @@ DEL_JS = """
 })();
 """
 
+SEL_JS = """
+(function () {
+  var selAll = document.getElementById('sel-all');
+  var selClear = document.getElementById('sel-clear');
+  var selDel = document.getElementById('sel-del');
+  var selCount = document.getElementById('sel-count');
+  if (!selAll || !selDel) return;
+  var boxes = Array.prototype.slice.call(
+      document.querySelectorAll('.pickbox'));
+
+  function selected() {
+    return boxes.filter(function (b) { return b.checked && !b.closest('[hidden]'); });
+  }
+  function refresh() {
+    var n = selected().length;
+    selCount.textContent = n;
+    selDel.disabled = (n === 0);
+  }
+  boxes.forEach(function (b) {
+    b.addEventListener('change', function () {
+      var card = b.closest('.page') || b.closest('.sess');
+      if (card) card.classList.toggle('selected', b.checked);
+      refresh();
+    });
+  });
+  selAll.addEventListener('change', function () {
+    boxes.forEach(function (b) {
+      var card = b.closest('.page') || b.closest('.sess');
+      var shown = card && !card.hidden;
+      if (shown) b.checked = selAll.checked;
+      if (card) card.classList.toggle('selected', b.checked);
+    });
+    refresh();
+  });
+  selClear.addEventListener('click', function () {
+    boxes.forEach(function (b) { b.checked = false; });
+    document.querySelectorAll('.card.selected').forEach(function (c) {
+      c.classList.remove('selected');
+    });
+    selAll.checked = false;
+    refresh();
+  });
+  selDel.addEventListener('click', function () {
+    var items = selected().map(function (b) {
+      return { kind: b.getAttribute('data-kind'), id: b.getAttribute('data-id') };
+    });
+    if (!items.length) return;
+    var kinds = {};
+    items.forEach(function (i) { kinds[i.kind] = (kinds[i.kind] || 0) + 1; });
+    var desc = Object.keys(kinds).map(function (k) {
+      return kinds[k] + ' ' + (k === 'page' ? 'page(s)' : 'recording(s)');
+    }).join(', ');
+    var body = { items: items };
+    if (items.length > 5) {
+      // matches BULK_DELETE_LIMIT in serve.py: big selections need a
+      // typed confirmation so the library can't be wiped by a slip
+      var typed = prompt('You selected ' + items.length + ' items.\n' +
+        'This permanently deletes them from the notebook AND the raw pen\n' +
+        'data — it cannot be undone.\n\nType DELETE (all caps) to proceed:');
+      if (typed !== 'DELETE') return;
+      body.confirm = 'DELETE';
+    } else if (!confirm('Delete ' + desc + '? This cannot be undone.')) {
+      return;
+    }
+    selDel.disabled = true;
+    var req = fetch('/api/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    req.then(function (r) { return r.json(); }).then(function (res) {
+      if (res.ok) { location.reload(); return; }
+      selDel.disabled = false;
+      alert(res.error || 'Delete failed.');
+    }).catch(function () {
+      selDel.disabled = false;
+      alert('Delete failed (network error).');
+    });
+  });
+})();
+"""
+
 TRANSCRIBE_JS = """
 (function () {
   document.addEventListener('click', function (e) {
@@ -221,6 +330,35 @@ TRANSCRIBE_JS = """
       btn.disabled = false;
       btn.textContent = old;
       alert('Transcription failed.');
+    });
+  });
+})();
+"""
+
+PUSH_JS = """
+(function () {
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('.push') : null;
+    if (!btn) return;
+    e.preventDefault();
+    var kind = btn.getAttribute('data-kind');
+    var id = btn.getAttribute('data-id');
+    var old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Sending\u2026';
+    fetch('/api/push/' + kind, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id })
+    }).then(function (r) { return r.json(); }).then(function (res) {
+      btn.disabled = false;
+      btn.textContent = old;
+      if (res.ok) { alert(res.message || 'Sent to Hermes.'); }
+      else { alert(res.error || 'Push failed.'); }
+    }).catch(function () {
+      btn.disabled = false;
+      btn.textContent = old;
+      alert('Push failed (network error).');
     });
   });
 })();
@@ -262,16 +400,20 @@ def build_index():
         search = ("%s %s" % (p.get("id", ""), text)).lower()
         delete = ('<button class="delete" data-kind="page" data-id="%s">Delete</button>'
                   % html.escape(str(p["id"]), quote=True))
+        push = ('<button class="push" data-kind="page" data-id="%s">Send to Hermes</button>'
+                % html.escape(str(p["id"]), quote=True))
         transcribe = ""
         if not p.get("ocr"):
             transcribe = ('<button class="transcribe" data-kind="page" '
                           'data-id="%s">Transcribe</button>'
                           % html.escape(str(p["id"]), quote=True))
         cards.append(
-            '<div class="page" data-search="{search}"><a class="thumb" '
+            '<div class="page" data-search="{search}"><label class="pick">'
+            '<input type="checkbox" class="pickbox" data-kind="page" data-id="{id}"></label>'
+            '<a class="thumb" '
             'href="{svg}"><img src="{thumb}" alt="{id}">'
             '<div class="id">{id}</div><div class="meta">{strokes} strokes</div></a>'
-            '<div class="actions">{download}{transcribe}{delete}</div>'
+            '<div class="actions">{download}{transcribe}{delete}{push}</div>'
             '{transcript}</div>'
             .format(
                 search=html.escape(search, quote=True),
@@ -282,6 +424,7 @@ def build_index():
                 download=download,
                 transcribe=transcribe,
                 delete=delete,
+                push=push,
                 transcript=transcript,
             )
         )
@@ -316,6 +459,8 @@ def build_index():
             note += '<br>Pages: <span class="pglinks">%s</span>' % links
         delete = ('<button class="delete" data-kind="session" data-id="%s">Delete</button>'
                   % html.escape(str(s.get("id", "")), quote=True))
+        push = ('<button class="push" data-kind="session" data-id="%s">Send to Hermes</button>'
+                % html.escape(str(s.get("id", "")), quote=True))
         transcript = (s.get("transcript") or "").strip()
         tx_block = ""
         tx_search = ""
@@ -337,14 +482,18 @@ def build_index():
                           % html.escape(str(s.get("id", "")), quote=True))
         sesses.append(
             '<div class="card sess" data-search="{search}">'
+            '<label class="pick"><input type="checkbox" class="pickbox" '
+            'data-kind="session" data-id="{sid}"></label>'
             '<div class="sess-head"><div class="note">{note}</div>'
-            '<div class="actions">{delete}{transcribe}</div></div>'
+            '<div class="actions">{delete}{transcribe}{push}</div></div>'
             '<div class="players">{players}</div>{tx}</div>'
             .format(
                 search=html.escape(search, quote=True),
                 note=note,
+                sid=html.escape(str(s.get("id", "")), quote=True),
                 delete=delete,
                 transcribe=transcribe,
+                push=push,
                 players=players,
                 tx=tx_block,
             )
@@ -356,7 +505,9 @@ def build_index():
         sessions="\n".join(sesses),
         search_js=SEARCH_JS,
         del_js=DEL_JS,
+        sel_js=SEL_JS,
         transcribe_js=TRANSCRIBE_JS,
+        push_js=PUSH_JS,
     )
     _LAST_GOOD = page
     return page
@@ -529,20 +680,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         send_json(self, 200, {"ok": True})
 
-    def do_POST(self):
-        if self.path.startswith("/api/transcribe/"):
-            return self._do_transcribe()
-        if not self.path.startswith("/api/delete/"):
-            send_json(self, 404, {"ok": False, "error": "not found"})
-            return
-
-        # content-type must be JSON
+    def _do_push(self):
+        """Push a page/session note to the Hermes echo-scribe webhook."""
         if "application/json" not in self.headers.get("Content-Type", ""):
             send_json(self, 400,
                       {"ok": False, "error": "Content-Type must be "
                                              "application/json"})
             return
-        # same-origin guard against CSRF (Origin, when present, must be us)
         host = self.headers.get("Host", "")
         origin = self.headers.get("Origin")
         if origin and origin not in ("http://" + host, "https://" + host,
@@ -550,12 +694,87 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             send_json(self, 403,
                       {"ok": False, "error": "cross-origin request denied"})
             return
-        # deletes are disabled on non-loopback hosts unless explicitly enabled
+        if not scribe._is_configured():
+            send_json(self, 503,
+                      {"ok": False,
+                       "error": "Hermes push is not configured "
+                                "(ECHO_SCRIBE_SECRET is not set)"})
+            return
+        kind = self.path[len("/api/push/"):]
+        if kind not in ("page", "session"):
+            send_json(self, 404, {"ok": False, "error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            send_json(self, 400, {"ok": False, "error": "empty request body"})
+            return
+        try:
+            ident = json.loads(
+                self.rfile.read(length).decode("utf-8"))["id"]
+        except (ValueError, KeyError, IndexError) as e:
+            send_json(self, 400,
+                      {"ok": False, "error": "bad JSON body: %s" % e})
+            return
+        valid = PAGE_ID_RE.match(ident) if kind == "page" \
+            else SESSION_ID_RE.match(ident)
+        if not valid:
+            send_json(self, 400,
+                      {"ok": False, "error": "invalid id format"})
+            return
+        # cheap existence check before doing work
+        index = scribe.load_index()
+        exists = any(p.get("id") == ident for p in index.get("pages", [])) \
+            if kind == "page" else \
+            any(s.get("id") == ident for s in index.get("sessions", []))
+        if not exists:
+            send_json(self, 404, {"ok": False, "error": "no such asset"})
+            return
+        try:
+            ok, message = scribe.push_one(kind, ident)
+        except Exception as e:
+            send_json(self, 500,
+                      {"ok": False, "error": "push failed: %s" % e})
+            return
+        send_json(self, 200 if ok else 502,
+                  {"ok": ok, "message": message})
+
+    def _post_guards(self):
+        """Common POST guards for mutating APIs.
+
+        Returns an error dict to send, or None when the request may proceed.
+        """
+        if "application/json" not in self.headers.get("Content-Type", ""):
+            return {"ok": False,
+                    "error": "Content-Type must be application/json"}
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        if origin and origin not in ("http://" + host, "https://" + host,
+                                     "null"):
+            return {"ok": False, "error": "cross-origin request denied"}
         if self.server.server_address[0] not in LOOPBACK_HOSTS and \
                 not os.environ.get("ECHO_ALLOW_LAN_DELETES"):
-            send_json(self, 403, {"ok": False, "error":
-                                  "Deletes disabled on a network host. Set "
-                                  "ECHO_ALLOW_LAN_DELETES=1 to enable."})
+            return {"ok": False,
+                    "error": "Deletes disabled on a network host. Set "
+                             "ECHO_ALLOW_LAN_DELETES=1 to enable."}
+        return None
+
+    def do_POST(self):
+        if self.path.startswith("/api/push/"):
+            return self._do_push()
+        if self.path.startswith("/api/transcribe/"):
+            return self._do_transcribe()
+        if self.path == "/api/delete":
+            return self._do_delete_batch()
+        if not self.path.startswith("/api/delete/"):
+            send_json(self, 404, {"ok": False, "error": "not found"})
+            return
+
+        guard = self._post_guards()
+        if guard:
+            send_json(self, 403, guard)
             return
 
         kind = self.path[len("/api/delete/"):]
@@ -601,6 +820,84 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if did_lock:
                 convert.release_lock()
         send_json(self, 200, {"ok": True})
+
+    def _do_delete_batch(self):
+        """Delete many pages/sessions in one locked, reconciled pass.
+
+        Body: {"items": [{"kind": "page"|"session", "id": "..."}, ...]}
+        All ids are validated before anything is removed; state and output
+        are reconciled once at the end.
+        """
+        guard = self._post_guards()
+        if guard:
+            send_json(self, 403, guard)
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            send_json(self, 400, {"ok": False, "error": "empty request body"})
+            return
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            items = payload["items"]
+        except (ValueError, KeyError, IndexError) as e:
+            send_json(self, 400,
+                      {"ok": False, "error": "bad JSON body: %s" % e})
+            return
+        if not isinstance(items, list) or not items:
+            send_json(self, 400, {"ok": False, "error": "items must be a "
+                                                        "non-empty list"})
+            return
+        # bulk guard: large batches (e.g. "select all shown") need the
+        # explicit typed confirmation the UI collects before sending
+        if len(items) > BULK_DELETE_LIMIT and \
+                payload.get("confirm") != "DELETE":
+            send_json(self, 400,
+                      {"ok": False,
+                       "error": "bulk delete of %d items requires "
+                                "{\"confirm\": \"DELETE\"} in the body "
+                                "(type DELETE in the dialog to proceed)"
+                                % len(items)})
+            return
+
+        # validate every item up front so a malformed batch removes nothing
+        for item in items:
+            if not isinstance(item, dict):
+                send_json(self, 400, {"ok": False, "error": "each item must "
+                                                            "be an object"})
+                return
+            ident = item.get("id")
+            kind = item.get("kind")
+            if kind not in ("page", "session") or not isinstance(ident, str):
+                send_json(self, 400, {"ok": False, "error": "invalid item: "
+                                                            "%r" % (item,)})
+                return
+            valid = PAGE_ID_RE.match(ident) if kind == "page" \
+                else SESSION_ID_RE.match(ident)
+            if not valid:
+                send_json(self, 400, {"ok": False, "error": "invalid id "
+                                                            "format: %r" % ident})
+                return
+
+        did_lock = convert.acquire_lock(wait=10.0)
+        try:
+            try:
+                for item in items:
+                    if item["kind"] == "page":
+                        delete_page(item["id"])
+                    else:
+                        delete_session(item["id"])
+            except OSError as e:
+                send_json(self, 500,
+                          {"ok": False, "error": "delete failed: %s" % e})
+                return
+            _reconcile()
+        finally:
+            if did_lock:
+                convert.release_lock()
+        send_json(self, 200, {"ok": True, "deleted": len(items)})
 
 
 def main():
