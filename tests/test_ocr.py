@@ -119,7 +119,7 @@ class ScoringTest(unittest.TestCase):
         self.assertEqual(ocr_eval.score_text("abc", ""), (1.0, 1.0))
 
     def test_one_substitution(self):
-        cer, wer = ocr_eval.score_text("phones are", "hones are")
+        cer, wer = ocr_eval.score_text("bright sun", "right sun")
         self.assertAlmostEqual(cer, 1 / 10)
         self.assertAlmostEqual(wer, 1 / 2)
 
