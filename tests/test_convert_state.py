@@ -78,6 +78,7 @@ class LockTest(unittest.TestCase):
             stdout=subprocess.PIPE, text=True)
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
+        assert holder.stdout is not None
         self.assertEqual(holder.stdout.readline().strip(), "held")
         self.assertTrue(convert.lock_is_held())
         with self.assertRaises(RuntimeError):

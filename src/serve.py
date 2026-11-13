@@ -7,6 +7,7 @@ page that lists pages (SVG previews) and audio sessions from index.json.
 Usage:  ./src/serve.py [--port 8000] [--host 0.0.0.0]
 """
 import argparse
+import contextlib
 import datetime
 import glob
 import html
@@ -31,16 +32,20 @@ OUT = paths.OUT
 CONVERT_PY = os.path.join(paths.SRC, "convert.py")
 INDEX = os.path.join(OUT, "index.json")
 
-# Path-traversal-safe id shapes (reject / \ .. leading '.', NUL, unicode.)
-PAGE_ID_RE = re.compile(r"^\d+(\.\d+)*$")
-SESSION_ID_RE = re.compile(r"^PRS-[0-9a-fA-F]+$")
+# Path-traversal-safe id shapes, matched with fullmatch: ASCII digits and
+# hex only, so / \ .. leading '.', NUL, newlines and unicode digits fail.
+PAGE_ID_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+SESSION_ID_RE = re.compile(r"PRS-[0-9a-fA-F]+")
 # pen notebook guid (hex, from the dump directory name) or legacy ids
-NOTEBOOK_ID_RE = re.compile(r"^(?:[0-9a-fA-F]{8,32}|0|251)$")
+NOTEBOOK_ID_RE = re.compile(r"[0-9a-fA-F]{8,32}|0|251")
+ID_PATTERNS = {"page": PAGE_ID_RE, "session": SESSION_ID_RE}
 # Batches larger than this require {"confirm": "DELETE"} in the request
 # body (and the UI asks the user to type DELETE first) — so a stray
 # "select all" + click can never wipe the whole library in one shot.
 BULK_DELETE_LIMIT = 5
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+MAX_BODY_BYTES = 1 << 20     # API bodies are tiny JSON objects
+LOCK_WAIT = 10.0             # seconds an API call waits for a running convert
 
 PAGE_TPL = """<!doctype html>
 <html><head>
@@ -202,6 +207,7 @@ SEARCH_JS = """
       if (match) shown++;
     });
     count.textContent = term ? shown + ' of ' + cards.length + ' matches' : '';
+    document.dispatchEvent(new Event('echo:filtered'));
   }
   q.addEventListener('input', apply);
   apply();
@@ -211,7 +217,7 @@ SEARCH_JS = """
 DEL_JS = """
 (function () {
   document.addEventListener('click', function (e) {
-    var btn = e.target.closest ? e.target.closest('.delete') : null;
+    var btn = e.target.closest ? e.target.closest('.delete[data-id]') : null;
     if (!btn) return;
     e.preventDefault();
     var kind = btn.getAttribute('data-kind');
@@ -311,8 +317,11 @@ SEL_JS = """
       document.querySelectorAll('.pickbox'));
 
   function selected() {
-    return boxes.filter(function (b) { return b.checked && !b.closest('[hidden]'); });
+    return boxes.filter(function (b) {
+      return b.checked && document.contains(b) && !b.closest('[hidden]');
+    });
   }
+  document.addEventListener('echo:filtered', function () { refresh(); });
   function refresh() {
     var n = selected().length;
     selCount.textContent = n;
@@ -659,8 +668,17 @@ _LAST_GOOD = None
 
 
 # ---------------------------------------------------------------------------
-# delete API
+# mutating APIs
 # ---------------------------------------------------------------------------
+
+class ApiError(Exception):
+    """A request the API refuses; becomes a JSON error response."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
 
 def find_session_dirs(session_id):
     """Return every raw pen session directory for ``session_id``."""
@@ -674,66 +692,89 @@ def _reconcile():
 
     Runs with ECHO_LOCK_HELD so the child skips locking (the caller holds
     the run lock). Output is regenerated atomically, so a concurrent GET
-    never sees a torn file.
+    never sees a torn file. Returns True when convert succeeded.
     """
     env = dict(os.environ)
     env["ECHO_LOCK_HELD"] = "1"
-    subprocess.run(
-        [sys.executable, CONVERT_PY],
-        env=env, check=False)
+    proc = subprocess.run([sys.executable, CONVERT_PY], env=env, check=False)
+    if proc.returncode != 0:
+        print("warning: reconcile convert exited %d" % proc.returncode,
+              file=sys.stderr)
+    return proc.returncode == 0
 
 
 def delete_page(page_id):
-    """Remove a page everywhere: raw dump, output, and incremental state."""
-    shutil.rmtree(os.path.join(OUT, "pages", page_id), ignore_errors=True)
-    shutil.rmtree(os.path.join(paths.DATA, "data", page_id),
-                  ignore_errors=True)
+    """Remove a page everywhere: raw dump, output, and incremental state.
+
+    Returns False when nothing of the page existed.
+    """
+    out_dir = os.path.join(OUT, "pages", page_id)
+    raw_dir = os.path.join(paths.DATA, "data", page_id)
+    existed = os.path.isdir(out_dir) or os.path.isdir(raw_dir)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    shutil.rmtree(raw_dir, ignore_errors=True)
     state = convert.load_state()
     state["page_entries"].pop(page_id, None)
     state["sources"] = {
         k: v for k, v in state["sources"].items()
         if not k.startswith("data/data/%s/" % page_id)}
     convert.save_state(state)
+    return existed
 
 
 def delete_session(session_id):
-    """Remove a recording everywhere: raw session dir, output audio, state."""
-    for d in find_session_dirs(session_id):
+    """Remove a recording everywhere: raw session dir, output audio, state.
+
+    Returns False when nothing of the recording existed.
+    """
+    raw_dirs = find_session_dirs(session_id)
+    audio = glob.glob(os.path.join(OUT, "audio", session_id + ".*.aac"))
+    existed = bool(raw_dirs or audio)
+    for d in raw_dirs:
         shutil.rmtree(d, ignore_errors=True)
-    for f in glob.glob(os.path.join(OUT, "audio", session_id + ".*.aac")):
+    for f in audio + [os.path.join(OUT, "audio", session_id + ".txt")]:
         try:
             os.remove(f)
         except OSError:
             pass
-    try:
-        os.remove(os.path.join(OUT, "audio", session_id + ".txt"))
-    except OSError:
-        pass
     state = convert.load_state()
     state["session_entries"].pop(session_id, None)
     state["sources"] = {
         k: v for k, v in state["sources"].items()
         if ("/sessions/%s/" % session_id) not in k}
     convert.save_state(state)
+    return existed
+
+
+def delete_asset(kind, ident):
+    """Delete one page or session; False when it did not exist."""
+    if kind == "page":
+        return delete_page(ident)
+    return delete_session(ident)
+
+
+@contextlib.contextmanager
+def run_lock():
+    """Hold the convert run lock, or refuse the request as busy (409)."""
+    try:
+        took = convert.acquire_lock(wait=LOCK_WAIT)
+    except RuntimeError as e:
+        raise ApiError(409, "busy: %s" % e) from e
+    try:
+        yield
+    finally:
+        if took:
+            convert.release_lock()
 
 
 def _run_convert_locked(argv):
-    """Run ``convert.py`` with ``argv`` under the run lock.
-
-    Sets ``ECHO_LOCK_HELD`` so the child skips locking (the caller holds
-    it). Returns True on success.
-    """
-    did_lock = convert.acquire_lock(wait=10.0)
-    try:
+    """Run ``convert.py`` with ``argv`` under the run lock; True on success."""
+    with run_lock():
         env = dict(os.environ)
         env["ECHO_LOCK_HELD"] = "1"
-        proc = subprocess.run(
-            [sys.executable, CONVERT_PY] + argv,
-            env=env, check=False)
+        proc = subprocess.run([sys.executable, CONVERT_PY] + argv,
+                              env=env, check=False)
         return proc.returncode == 0
-    finally:
-        if did_lock:
-            convert.release_lock()
 
 
 def send_json(handler, status, payload):
@@ -746,11 +787,102 @@ def send_json(handler, status, payload):
     handler.wfile.write(body)
 
 
+def asset_id(payload, kind):
+    """The validated ``id`` of a page or session request body."""
+    ident = payload.get("id")
+    if not isinstance(ident, str) or not ID_PATTERNS[kind].fullmatch(ident):
+        raise ApiError(400, "invalid id format")
+    return ident
+
+
+def any_asset_id(payload):
+    """A validated page or session id (titles apply to both)."""
+    ident = payload.get("id")
+    if not isinstance(ident, str):
+        raise ApiError(400, "invalid page/session id")
+    if not any(p.fullmatch(ident) for p in ID_PATTERNS.values()):
+        raise ApiError(400, "invalid page/session id")
+    return ident
+
+
+def display_name(payload, limit):
+    name = payload.get("name")
+    if not isinstance(name, str):
+        raise ApiError(400, "name must be a string")
+    name = name.strip()
+    if len(name) > limit:
+        raise ApiError(400, "name too long (max %d chars)" % limit)
+    return name
+
+
+def host_name(host_header):
+    """Lower-case host name from a Host header, without the port."""
+    try:
+        return (urllib.parse.urlsplit("//" + host_header).hostname or "")
+    except ValueError:
+        return ""
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=OUT, **kwargs)
 
+    # -- request guards ----------------------------------------------------
+
+    def _bound_to_loopback(self):
+        address = self.server.server_address
+        host = address[0] if isinstance(address, tuple) else address
+        return str(host) in LOOPBACK_HOSTS
+
+    def _host_allowed(self):
+        """Refuse DNS-rebinding: a loopback server answers loopback names only.
+
+        A page on another site can point its own host name at 127.0.0.1;
+        the browser then treats this server as same-origin with that site.
+        """
+        if not self._bound_to_loopback():
+            return True
+        return host_name(self.headers.get("Host", "")) in LOOPBACK_HOSTS
+
+    def _check_mutation(self):
+        """Guards shared by every POST API; raises ApiError to refuse."""
+        media_type = self.headers.get("Content-Type", "").split(";")[0]
+        if media_type.strip().lower() != "application/json":
+            raise ApiError(415, "Content-Type must be application/json")
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        if origin is not None and origin not in ("http://" + host,
+                                                 "https://" + host):
+            raise ApiError(403, "cross-origin request denied")
+        if not self._bound_to_loopback() and \
+                not os.environ.get("ECHO_ALLOW_LAN_DELETES"):
+            raise ApiError(403, "Changes are disabled on a network host. "
+                                "Set ECHO_ALLOW_LAN_DELETES=1 to enable.")
+
+    def _read_json(self):
+        """The request body as a JSON object; raises ApiError otherwise."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            raise ApiError(400, "empty request body")
+        if length > MAX_BODY_BYTES:
+            raise ApiError(413, "request body too large")
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise ApiError(400, "bad JSON body: %s" % e) from e
+        if not isinstance(payload, dict):
+            raise ApiError(400, "JSON body must be an object")
+        return payload
+
+    # -- dispatch ------------------------------------------------------------
+
     def do_GET(self):
+        if not self._host_allowed():
+            send_json(self, 403, {"ok": False, "error": "unexpected Host"})
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/" or path == "":
             body = build_index().encode("utf-8")
@@ -765,209 +897,96 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         else:
             super().do_GET()
 
-    def _do_transcribe(self):
-        """On-demand transcription: OCR a page or STT a session."""
-        if "application/json" not in self.headers.get("Content-Type", ""):
-            send_json(self, 400,
-                      {"ok": False, "error": "Content-Type must be "
-                                             "application/json"})
+    def do_HEAD(self):
+        if not self._host_allowed():
+            send_json(self, 403, {"ok": False, "error": "unexpected Host"})
             return
-        host = self.headers.get("Host", "")
-        origin = self.headers.get("Origin")
-        if origin and origin not in ("http://" + host, "https://" + host,
-                                     "null"):
-            send_json(self, 403,
-                      {"ok": False, "error": "cross-origin request denied"})
-            return
-        kind = self.path[len("/api/transcribe/"):]
-        if kind not in ("page", "session"):
+        super().do_HEAD()
+
+    def do_POST(self):
+        route = self._route()
+        if route is None:
             send_json(self, 404, {"ok": False, "error": "not found"})
             return
+        handler, arg = route
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length <= 0:
-            send_json(self, 400, {"ok": False, "error": "empty request body"})
-            return
-        try:
-            ident = json.loads(
-                self.rfile.read(length).decode("utf-8"))["id"]
-        except (ValueError, KeyError, IndexError) as e:
-            send_json(self, 400,
-                      {"ok": False, "error": "bad JSON body: %s" % e})
-            return
-        valid = PAGE_ID_RE.match(ident) if kind == "page" \
-            else SESSION_ID_RE.match(ident)
-        if not valid:
-            send_json(self, 400,
-                      {"ok": False, "error": "invalid id format"})
-            return
+            if not self._host_allowed():
+                raise ApiError(403, "unexpected Host")
+            self._check_mutation()
+            status, payload = handler(self._read_json(), *arg)
+        except ApiError as e:
+            status, payload = e.status, {"ok": False, "error": e.message}
+        send_json(self, status, payload)
+
+    def _route(self):
+        """(handler, extra args) for this POST path, or None."""
+        exact = {
+            "/api/delete": (self._do_delete_batch, ()),
+            "/api/rename": (self._do_rename, ()),
+            "/api/title": (self._do_title, ()),
+        }
+        if self.path in exact:
+            return exact[self.path]
+        for prefix, handler in (("/api/delete/", self._do_delete_one),
+                                ("/api/transcribe/", self._do_transcribe),
+                                ("/api/push/", self._do_push)):
+            kind = self.path[len(prefix):]
+            if self.path.startswith(prefix) and kind in ID_PATTERNS:
+                return handler, (kind,)
+        return None
+
+    # -- handlers: (payload, *args) -> (status, response) ---------------------
+
+    def _do_transcribe(self, payload, kind):
+        """On-demand transcription: OCR a page or STT a session."""
+        ident = asset_id(payload, kind)
         # the id must actually exist before we spend a long transcription
         if kind == "page":
-            if not os.path.isdir(os.path.join(paths.DATA, "data", ident)):
-                send_json(self, 404,
-                          {"ok": False, "error": "no such page"})
-                return
+            exists = os.path.isdir(os.path.join(paths.DATA, "data", ident))
         else:
-            if not find_session_dirs(ident):
-                send_json(self, 404,
-                          {"ok": False, "error": "no such session"})
-                return
+            exists = bool(find_session_dirs(ident))
+        if not exists:
+            raise ApiError(404, "no such %s" % kind)
         argv = ["--ocr", "--page", ident] if kind == "page" \
             else ["--stt", "--session", ident]
         if not _run_convert_locked(argv):
-            send_json(self, 500,
-                      {"ok": False, "error": "transcription failed"})
-            return
-        send_json(self, 200, {"ok": True})
+            raise ApiError(500, "transcription failed")
+        return 200, {"ok": True}
 
-    def _do_push(self):
+    def _do_push(self, payload, kind):
         """Push a page/session note to the Hermes echo-scribe webhook."""
-        if "application/json" not in self.headers.get("Content-Type", ""):
-            send_json(self, 400,
-                      {"ok": False, "error": "Content-Type must be "
-                                             "application/json"})
-            return
-        host = self.headers.get("Host", "")
-        origin = self.headers.get("Origin")
-        if origin and origin not in ("http://" + host, "https://" + host,
-                                     "null"):
-            send_json(self, 403,
-                      {"ok": False, "error": "cross-origin request denied"})
-            return
         if not scribe._is_configured():
-            send_json(self, 503,
-                      {"ok": False,
-                       "error": "Hermes push is not configured "
-                                "(ECHO_SCRIBE_SECRET is not set)"})
-            return
-        kind = self.path[len("/api/push/"):]
-        if kind not in ("page", "session"):
-            send_json(self, 404, {"ok": False, "error": "not found"})
-            return
+            raise ApiError(503, "Hermes push is not configured "
+                                "(ECHO_SCRIBE_SECRET is not set)")
+        ident = asset_id(payload, kind)
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length <= 0:
-            send_json(self, 400, {"ok": False, "error": "empty request body"})
-            return
-        try:
-            ident = json.loads(
-                self.rfile.read(length).decode("utf-8"))["id"]
-        except (ValueError, KeyError, IndexError) as e:
-            send_json(self, 400,
-                      {"ok": False, "error": "bad JSON body: %s" % e})
-            return
-        valid = PAGE_ID_RE.match(ident) if kind == "page" \
-            else SESSION_ID_RE.match(ident)
-        if not valid:
-            send_json(self, 400,
-                      {"ok": False, "error": "invalid id format"})
-            return
-        # cheap existence check before doing work
-        index = scribe.load_index()
-        exists = any(p.get("id") == ident for p in index.get("pages", [])) \
-            if kind == "page" else \
-            any(s.get("id") == ident for s in index.get("sessions", []))
-        if not exists:
-            send_json(self, 404, {"ok": False, "error": "no such asset"})
-            return
+            index = scribe.load_index()
+        except (OSError, ValueError) as e:
+            raise ApiError(404, "no converted output yet; run ./run convert") \
+                from e
+        listed = index.get("pages" if kind == "page" else "sessions", [])
+        if not any(a.get("id") == ident for a in listed):
+            raise ApiError(404, "no such asset")
         try:
             ok, message = scribe.push_one(kind, ident)
         except Exception as e:
-            send_json(self, 500,
-                      {"ok": False, "error": "push failed: %s" % e})
-            return
-        send_json(self, 200 if ok else 502,
-                  {"ok": ok, "message": message})
+            raise ApiError(500, "push failed: %s" % e) from e
+        if not ok:
+            raise ApiError(502, message)
+        return 200, {"ok": True, "message": message}
 
-    def _post_guards(self):
-        """Common POST guards for mutating APIs.
-
-        Returns an error dict to send, or None when the request may proceed.
-        """
-        if "application/json" not in self.headers.get("Content-Type", ""):
-            return {"ok": False,
-                    "error": "Content-Type must be application/json"}
-        host = self.headers.get("Host", "")
-        origin = self.headers.get("Origin")
-        if origin and origin not in ("http://" + host, "https://" + host,
-                                     "null"):
-            return {"ok": False, "error": "cross-origin request denied"}
-        if self.server.server_address[0] not in LOOPBACK_HOSTS and \
-                not os.environ.get("ECHO_ALLOW_LAN_DELETES"):
-            return {"ok": False,
-                    "error": "Deletes disabled on a network host. Set "
-                             "ECHO_ALLOW_LAN_DELETES=1 to enable."}
-        return None
-
-    def do_POST(self):
-        if self.path.startswith("/api/push/"):
-            return self._do_push()
-        if self.path.startswith("/api/transcribe/"):
-            return self._do_transcribe()
-        if self.path == "/api/delete":
-            return self._do_delete_batch()
-        if self.path == "/api/rename":
-            return self._do_rename()
-        if self.path == "/api/title":
-            return self._do_title()
-        if not self.path.startswith("/api/delete/"):
-            send_json(self, 404, {"ok": False, "error": "not found"})
-            return
-
-        guard = self._post_guards()
-        if guard:
-            send_json(self, 403, guard)
-            return
-
-        kind = self.path[len("/api/delete/"):]
-        if kind not in ("page", "session"):
-            send_json(self, 404, {"ok": False, "error": "not found"})
-            return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length <= 0:
-            send_json(self, 400, {"ok": False, "error": "empty request body"})
-            return
-        try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            ident = payload["id"]
-        except (ValueError, KeyError, IndexError) as e:
-            send_json(self, 400,
-                      {"ok": False, "error": "bad JSON body: %s" % e})
-            return
-
-        # validate the id strictly; rejects traversal, NUL, unicode tricks
-        valid = PAGE_ID_RE.match(ident) if kind == "page" \
-            else SESSION_ID_RE.match(ident)
-        if not valid:
-            send_json(self, 400,
-                      {"ok": False, "error": "invalid id format"})
-            return
-
-        did_lock = convert.acquire_lock(wait=10.0)
-        try:
+    def _do_delete_one(self, payload, kind):
+        ident = asset_id(payload, kind)
+        with run_lock():
             try:
-                if kind == "page":
-                    delete_page(ident)
-                else:
-                    delete_session(ident)
-            except OSError as e:
-                send_json(self, 500,
-                          {"ok": False, "error": "delete failed: %s" % e})
-                return
-            _reconcile()
-        finally:
-            if did_lock:
-                convert.release_lock()
-        send_json(self, 200, {"ok": True})
+                existed = delete_asset(kind, ident)
+            finally:
+                _reconcile()
+        if not existed:
+            raise ApiError(404, "no such %s" % kind)
+        return 200, {"ok": True}
 
-    def _do_rename(self):
+    def _do_rename(self, payload):
         """Assign a friendly display name to a notebook guid.
 
         Body: {"id": "<guid>", "name": "Field Notes"}. Stored in the
@@ -975,51 +994,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         convert rebuilds index.json so every session card picks it up.
         Send name:"" to clear the alias back to the raw guid.
         """
-        guard = self._post_guards()
-        if guard:
-            send_json(self, 403, guard)
-            return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            ident, name = payload["id"], payload["name"]
-        except (ValueError, KeyError, TypeError) as e:
-            send_json(self, 400,
-                      {"ok": False, "error": "bad JSON body: %s" % e})
-            return
-        if not NOTEBOOK_ID_RE.match(str(ident)):
-            send_json(self, 400, {"ok": False, "error": "invalid notebook id"})
-            return
-        name = str(name).strip()
-        if len(name) > 60:
-            send_json(self, 400, {"ok": False,
-                                  "error": "name too long (max 60 chars)"})
-            return
-        names = convert.load_notebook_names()
-        if name:
-            names[str(ident)] = name
-        else:
-            names.pop(str(ident), None)
-        try:
-            convert.atomic_write(convert.NOTEBOOK_NAMES_PATH,
-                                 json.dumps(names, indent=2, sort_keys=True)
-                                 + "\n")
-        except OSError as e:
-            send_json(self, 500,
-                      {"ok": False, "error": "saving name failed: %s" % e})
-            return
-        did_lock = convert.acquire_lock(wait=10.0)
-        try:
+        ident = payload.get("id")
+        if not isinstance(ident, str) or not NOTEBOOK_ID_RE.fullmatch(ident):
+            raise ApiError(400, "invalid notebook id")
+        name = display_name(payload, 60)
+        with run_lock():
+            names = convert.load_notebook_names()
+            if name:
+                names[ident] = name
+            else:
+                names.pop(ident, None)
+            write_json_file(convert.NOTEBOOK_NAMES_PATH, names)
             _reconcile()
-        finally:
-            if did_lock:
-                convert.release_lock()
-        send_json(self, 200, {"ok": True, "name": name})
+        return 200, {"ok": True, "name": name}
 
-    def _do_title(self):
+    def _do_title(self, payload):
         """Assign a title to a single asset (page or recording).
 
         Body: {"id": "<page id or PRS-…>", "name": "Field sketch"} — the
@@ -1027,129 +1016,64 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         Atomic write, then a locked convert rebuilds index.json.
         Send name:"" to clear the title.
         """
-        guard = self._post_guards()
-        if guard:
-            send_json(self, 403, guard)
-            return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            ident, name = payload["id"], payload["name"]
-        except (ValueError, KeyError, TypeError) as e:
-            send_json(self, 400,
-                      {"ok": False, "error": "bad JSON body: %s" % e})
-            return
-        ident = str(ident)
-        if not (SESSION_ID_RE.match(ident) or PAGE_ID_RE.match(ident)):
-            send_json(self, 400,
-                      {"ok": False, "error": "invalid page/session id"})
-            return
-        name = str(name).strip()
-        if len(name) > 80:
-            send_json(self, 400, {"ok": False,
-                                  "error": "title too long (max 80 chars)"})
-            return
-        titles = convert.load_titles()
-        if name:
-            titles[ident] = name
-        else:
-            titles.pop(ident, None)
-        try:
-            convert.atomic_write(convert.TITLES_PATH,
-                                 json.dumps(titles, indent=2, sort_keys=True)
-                                 + "\n")
-        except OSError as e:
-            send_json(self, 500,
-                      {"ok": False, "error": "saving title failed: %s" % e})
-            return
-        did_lock = convert.acquire_lock(wait=10.0)
-        try:
+        ident = any_asset_id(payload)
+        name = display_name(payload, 80)
+        with run_lock():
+            titles = convert.load_titles()
+            if name:
+                titles[ident] = name
+            else:
+                titles.pop(ident, None)
+            write_json_file(convert.TITLES_PATH, titles)
             _reconcile()
-        finally:
-            if did_lock:
-                convert.release_lock()
-        send_json(self, 200, {"ok": True, "name": name})
+        return 200, {"ok": True, "name": name}
 
-    def _do_delete_batch(self):
+    def _do_delete_batch(self, payload):
         """Delete many pages/sessions in one locked, reconciled pass.
 
         Body: {"items": [{"kind": "page"|"session", "id": "..."}, ...]}
         All ids are validated before anything is removed; state and output
-        are reconciled once at the end.
+        are reconciled once at the end, even when a delete fails midway.
         """
-        guard = self._post_guards()
-        if guard:
-            send_json(self, 403, guard)
-            return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length <= 0:
-            send_json(self, 400, {"ok": False, "error": "empty request body"})
-            return
-        try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            items = payload["items"]
-        except (ValueError, KeyError, IndexError) as e:
-            send_json(self, 400,
-                      {"ok": False, "error": "bad JSON body: %s" % e})
-            return
+        items = payload.get("items")
         if not isinstance(items, list) or not items:
-            send_json(self, 400, {"ok": False, "error": "items must be a "
-                                                        "non-empty list"})
-            return
+            raise ApiError(400, "items must be a non-empty list")
         # bulk guard: large batches (e.g. "select all shown") need the
         # explicit typed confirmation the UI collects before sending
         if len(items) > BULK_DELETE_LIMIT and \
                 payload.get("confirm") != "DELETE":
-            send_json(self, 400,
-                      {"ok": False,
-                       "error": "bulk delete of %d items requires "
+            raise ApiError(400, "bulk delete of %d items requires "
                                 "{\"confirm\": \"DELETE\"} in the body "
                                 "(type DELETE in the dialog to proceed)"
-                                % len(items)})
-            return
-
-        # validate every item up front so a malformed batch removes nothing
-        for item in items:
-            if not isinstance(item, dict):
-                send_json(self, 400, {"ok": False, "error": "each item must "
-                                                            "be an object"})
-                return
-            ident = item.get("id")
-            kind = item.get("kind")
-            if kind not in ("page", "session") or not isinstance(ident, str):
-                send_json(self, 400, {"ok": False, "error": "invalid item: "
-                                                            "%r" % (item,)})
-                return
-            valid = PAGE_ID_RE.match(ident) if kind == "page" \
-                else SESSION_ID_RE.match(ident)
-            if not valid:
-                send_json(self, 400, {"ok": False, "error": "invalid id "
-                                                            "format: %r" % ident})
-                return
-
-        did_lock = convert.acquire_lock(wait=10.0)
-        try:
+                                % len(items))
+        targets = [batch_target(item) for item in items]
+        deleted = 0
+        with run_lock():
             try:
-                for item in items:
-                    if item["kind"] == "page":
-                        delete_page(item["id"])
-                    else:
-                        delete_session(item["id"])
+                for kind, ident in targets:
+                    deleted += bool(delete_asset(kind, ident))
             except OSError as e:
-                send_json(self, 500,
-                          {"ok": False, "error": "delete failed: %s" % e})
-                return
-            _reconcile()
-        finally:
-            if did_lock:
-                convert.release_lock()
-        send_json(self, 200, {"ok": True, "deleted": len(items)})
+                raise ApiError(500, "delete failed after %d item(s): %s"
+                                    % (deleted, e)) from e
+            finally:
+                _reconcile()
+        return 200, {"ok": True, "deleted": deleted,
+                     "missing": len(targets) - deleted}
+
+
+def batch_target(item):
+    """(kind, id) of one batch-delete item; raises ApiError when invalid."""
+    if not isinstance(item, dict) or item.get("kind") not in ID_PATTERNS:
+        raise ApiError(400, "invalid item: %r" % (item,))
+    return item["kind"], asset_id(item, item["kind"])
+
+
+def write_json_file(path, data):
+    try:
+        convert.atomic_write(path, json.dumps(data, indent=2, sort_keys=True)
+                             + "\n")
+    except OSError as e:
+        raise ApiError(500, "saving failed: %s" % e) from e
 
 
 def main():
@@ -1160,8 +1084,9 @@ def main():
     args = ap.parse_args()
 
     with http.server.ThreadingHTTPServer((args.host, args.port), Handler) as httpd:
+        host, port = httpd.server_address[:2]
         print("Serving notebook at http://%s:%d/  (output dir: %s)"
-              % (args.host, args.port, OUT))
+              % (host, port, OUT))
         httpd.serve_forever()
 
 
