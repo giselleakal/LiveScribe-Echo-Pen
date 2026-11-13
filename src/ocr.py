@@ -90,8 +90,8 @@ def available():
 def trocr_available():
     """True when the TrOCR Python dependencies can be imported."""
     try:
-        import torch  # noqa: F401
-        import transformers  # noqa: F401
+        import torch  # noqa: F401 # pyright: ignore[reportMissingImports]
+        import transformers  # noqa: F401 # pyright: ignore[reportMissingImports]
         from PIL import Image  # noqa: F401
     except Exception:
         return False
@@ -107,8 +107,8 @@ def _load_trocr():
 
 
 def _build_trocr():
-    import torch
-    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+    import torch  # pyright: ignore[reportMissingImports]
+    from transformers import TrOCRProcessor, VisionEncoderDecoderModel  # pyright: ignore[reportMissingImports]
 
     torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
     with telemetry.io_call(log, "trocr.load", model=TROCR_MODEL):

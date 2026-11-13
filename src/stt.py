@@ -35,7 +35,7 @@ _model = None
 def ffmpeg_exe():
     """Path to a usable ffmpeg binary (from imageio-ffmpeg), or None."""
     try:
-        import imageio_ffmpeg
+        import imageio_ffmpeg  # pyright: ignore[reportMissingImports]
     except Exception:
         return None
     try:
@@ -49,8 +49,8 @@ def available():
     if ffmpeg_exe() is None:
         return False
     try:
-        import torch  # noqa: F401
-        import transformers  # noqa: F401
+        import torch  # noqa: F401 # pyright: ignore[reportMissingImports]
+        import transformers  # noqa: F401 # pyright: ignore[reportMissingImports]
         import numpy  # noqa: F401
     except Exception:
         return False
@@ -61,8 +61,8 @@ def _load_model():
     """Lazily load Moonshine (CPU, capped threads) and its processor."""
     global _model
     if _model is None:
-        import torch
-        from transformers import AutoProcessor, MoonshineForConditionalGeneration
+        import torch  # pyright: ignore[reportMissingImports]
+        from transformers import AutoProcessor, MoonshineForConditionalGeneration  # pyright: ignore[reportMissingImports]
 
         torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
         with telemetry.io_call(log, "moonshine.load", model=MOONSHINE_MODEL):

@@ -29,3 +29,6 @@ test-inbox/
 
 # structured logs (./run logs)
 logs/
+
+# handwriting samples and ground truth are notes: never committed
+training/private/

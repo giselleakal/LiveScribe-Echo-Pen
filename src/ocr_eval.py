@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Score OCR against ground truth: character and word error rates.
 
-Reads a manifest (default ``training/eval.json``)::
+Reads a manifest (default ``training/private/eval.json``, gitignored)::
 
     {"samples": [
         {"id": "fox", "page": "2208.1.12.25", "truth": "the quick ..."},
-        {"id": "digits", "image": "samples/digits.png", "truth": "0 1 2"}
+        {"id": "digits", "image": "digits.png", "truth": "0 1 2"}
     ]}
 
 ``page`` samples run the full pipeline (strokes from data/, line
@@ -37,7 +37,8 @@ log = telemetry.get_logger("ocr-eval")
 
 SUMMARY = "Score OCR against ground truth: character and word error rates."
 
-DEFAULT_MANIFEST = os.path.join(paths.REPO, "training", "eval.json")
+DEFAULT_MANIFEST = os.path.join(paths.REPO, "training", "private",
+                                "eval.json")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,7 +178,8 @@ def choose_engine(requested):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=SUMMARY)
     ap.add_argument("--manifest", default=DEFAULT_MANIFEST,
-                    help="samples file (default: training/eval.json)")
+                    help="samples file (default: "
+                         "training/private/eval.json)")
     ap.add_argument("--engine", choices=("auto", "trocr", "tesseract"),
                     default="auto")
     ap.add_argument("--profile", choices=sorted(ocr.PROFILES),
@@ -188,6 +190,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
     try:
         samples = load_manifest(args.manifest)
+    except FileNotFoundError:
+        print(f"no manifest at {args.manifest}; see training/README.md to "
+              "create one", file=sys.stderr)
+        return 2
     except (OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

@@ -13,10 +13,9 @@ server publishes them with full-text page search.
 
 ## Handwriting recognition training
 
-Ground-truth samples for measuring and improving the OCR live in
-[`training/README.md`](training/README.md). This repository is public:
-only commit samples whose content is safe to publish (see "Privacy" in
-that doc).
+How to measure and improve the OCR against pages you know the text of:
+[`training/README.md`](training/README.md). Samples and ground truth stay
+in the gitignored `training/private/`; notes never go in this repository.
 
 ## Quick start
 
