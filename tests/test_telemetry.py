@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -23,6 +24,17 @@ def last(event=None):
         if event is None or rec.get("event") == event:
             return rec
     raise AssertionError(f"no {event} record")
+
+
+def wait_for(fetch, count, timeout=5.0):
+    """``fetch()`` once it returns ``count`` items: the server writes its
+    request record just after the response reaches the client."""
+    deadline = time.monotonic() + timeout
+    found = fetch()
+    while len(found) < count and time.monotonic() < deadline:
+        time.sleep(0.02)
+        found = fetch()
+    return found
 
 
 class RecordShapeTest(unittest.TestCase):
@@ -82,8 +94,13 @@ class IoCallTest(unittest.TestCase):
         fixtures.reset_sandbox()
         self.log = telemetry.get_logger("test")
         ticks = iter([10.0, 10.25])
-        patcher = mock.patch.object(telemetry, "monotonic",
-                                    lambda: next(ticks))
+        me = threading.get_ident()
+        real = telemetry.monotonic
+        # only this test's thread sees the fake clock; a server thread
+        # left over from another test must not consume its ticks
+        patcher = mock.patch.object(
+            telemetry, "monotonic",
+            lambda: next(ticks) if threading.get_ident() == me else real())
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -145,7 +162,9 @@ class ServeRecordTest(unittest.TestCase):
                          headers={"Content-Type": "application/json"})
             conn.getresponse().read()
             conn.close()
-        recs = [r for r in records() if r.get("event") == "http.request"]
+        recs = wait_for(lambda: [
+            r for r in records() if r.get("event") == "http.request"
+            and r.get("path") == "/api/title"], count=2)
         self.assertEqual([(r["status"], r["level"]) for r in recs],
                          [(400, "INFO"), (400, "INFO")])
         self.assertEqual(len({r["request_id"] for r in recs}), 2)
