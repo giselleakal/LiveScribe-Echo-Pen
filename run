@@ -28,6 +28,7 @@
 #   ./run logs          recent log records; --errors, --run last, --json
 #   ./run debug-report  write a shareable report (no note content)
 #   ./run test          run the test suite
+#   ./run ui-check      page layout shift + screenshots (needs chromium)
 #   ./run help          this message
 #
 # The pen only appears inside WSL after scripts/windows-connect.ps1 has
@@ -332,6 +333,10 @@ case "$mode" in
     debug-report)
         shift
         exec "$PYTHON" "$ROOT/src/doctor.py" report "$@"
+        ;;
+    ui-check)
+        shift
+        exec "$PYTHON" "$ROOT/scripts/ui-check.py" "$@"
         ;;
     test)
         shift

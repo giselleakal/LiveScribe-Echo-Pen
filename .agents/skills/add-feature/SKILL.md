@@ -65,7 +65,8 @@ Where things live:
 |---|---|
 | commands (`./run …`) and their help text | `run` (help = comment block at the top) |
 | pen data → SVG/PNG, index, state, lock | `src/convert.py` |
-| web page and its APIs | `src/serve.py` (stdlib only) |
+| web page markup | `src/webpage.py`; styles, script, skeleton in `src/web/` |
+| web APIs | `src/serve.py` (stdlib only) |
 | handwriting recognition, profiles | `src/ocr.py`, `src/ocr_eval.py` |
 | speech-to-text | `src/stt.py` |
 | sending notes to Hermes | `src/scribe.py` |
@@ -155,7 +156,7 @@ report the actual results, including any skipped tests:
 | Python 3.10 | `uv run --python 3.10 python -m unittest discover -s tests -t .` (if uv exists) |
 | shell scripts, if changed | `bash -n run`; `uvx --from shellcheck-py shellcheck run` |
 | pipeline in a sandbox | `ECHO_ROOT=$(mktemp -d) ./run convert` with fixture data, or the person's real `./run convert` |
-| web page, if changed | `./run`, then the person clicks through it; or `curl -s localhost:8000/` |
+| web page, if changed | `./run ui-check` (layout shift + screenshots for the PR), then `./run` and the person clicks through it |
 | OCR, if changed | `./run ocr-eval --profile legacy` vs the new profile |
 | setup still fine | `./run doctor` |
 
