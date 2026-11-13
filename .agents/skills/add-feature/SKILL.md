@@ -62,7 +62,8 @@ Where things live:
 |---|---|
 | commands (`./run …`) and their help text | `run` (help = comment block at the top) |
 | pen data → SVG/PNG, index, state, lock | `src/convert.py` |
-| web page and its APIs | `src/serve.py` (stdlib only) |
+| web page markup | `src/webpage.py`; styles, script, skeleton in `src/web/` |
+| web APIs | `src/serve.py` (stdlib only) |
 | handwriting recognition, profiles | `src/ocr.py`, `src/ocr_eval.py` |
 | speech-to-text | `src/stt.py` |
 | sending notes to Hermes | `src/scribe.py` |

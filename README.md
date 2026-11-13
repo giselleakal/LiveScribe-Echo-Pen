@@ -244,7 +244,8 @@ data/      raw output of dumpscribe              (gitignored)
 output/    generated site content                (gitignored)
 logs/      structured logs, debug reports        (gitignored)
 scripts/   windows-connect.ps1, build-dumpscribe.sh, push test harness
-src/       convert.py (pipeline), serve.py (web), ocr.py + ocr_eval.py,
+src/       convert.py (pipeline), serve.py (web server + API), webpage.py
+           + web/ (the page: markup, style.css, app.js), ocr.py + ocr_eval.py,
            stt.py, scribe.py (Hermes push), telemetry.py (logs),
            doctor.py (checks, debug report), paths.py (ECHO_ROOT)
 tests/     stdlib unittest suite + synthetic pen data (./run test)

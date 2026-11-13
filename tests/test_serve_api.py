@@ -9,6 +9,7 @@ from unittest import mock
 
 import convert
 import serve
+import webpage
 from tests import fixtures
 
 
@@ -68,8 +69,8 @@ class ServeApiTest(unittest.TestCase):
     def test_index_without_output_explains_what_to_run(self):
         status, body = self.request("GET", "/")
         self.assertEqual(status, 200)
-        self.assertTrue(body.startswith("<h2>No converted output yet"),
-                        body[:80])
+        self.assertIn("No converted output yet", body)
+        self.assertIn("./run", body)
 
     def test_cross_origin_delete_is_refused(self):
         status, body = self.request(
@@ -189,7 +190,7 @@ class ServeApiTest(unittest.TestCase):
         self.assertEqual(status, 404)
 
     def test_bulk_delete_button_is_not_bound_to_single_delete(self):
-        self.assertIn(".delete[data-id]", serve.DEL_JS)
+        self.assertIn("'.delete[data-id]'", webpage._read("app.js"))
 
     def test_traversal_ids_are_rejected(self):
         for ident in ("../../etc", "1.2/../3", ".hidden", "1.2.3.4\x00"):
@@ -259,12 +260,12 @@ class LanServerTest(unittest.TestCase):
 class FormatWhenTest(unittest.TestCase):
     def test_same_day_range_is_abbreviated(self):
         self.assertEqual(
-            serve._fmt_when("2026-11-10T10:16:00-0600",
+            webpage.fmt_when("2026-11-10T10:16:00-0600",
                             "2026-11-10T10:34:00-0600"),
             "Nov 10, 2026, 10:16 AM - 10:34 AM")
 
     def test_unparseable_is_empty(self):
-        self.assertEqual(serve._fmt_when("yesterday"), "")
+        self.assertEqual(webpage.fmt_when("yesterday"), "")
 
 
 if __name__ == "__main__":

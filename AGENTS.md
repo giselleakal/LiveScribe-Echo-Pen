@@ -107,6 +107,15 @@ history needs the repository owner and a force-push.
     loopback Host names (DNS rebinding).
   - New endpoints go through `Handler._route` and raise `ApiError`. Never
     hand-roll a check.
+- The web page is `src/webpage.py` (stdlib only), which builds the markup
+  and escapes every value. Its styles, script and skeleton live in
+  `src/web/` (`style.css`, `app.js`, `page.html`); they are read and inlined
+  on every request, so edits show up on reload:
+  - Nothing may move while the page loads: images carry `width`/`height`,
+    thumbnails sit in fixed-shape frames, busy buttons keep their width.
+  - Animations go inside `@media (prefers-reduced-motion: no-preference)`.
+  - Results are toasts (`toast()` in `app.js`); destructive steps keep
+    `confirm`/`prompt`. New buttons join the `ACTIONS` table.
 - Notebook display names live in `notebook_names.json` (guid -> friendly
   name, edited via `/api/rename`). Per-asset titles live in `titles.json`
   (asset id -> title, via `/api/title`).
