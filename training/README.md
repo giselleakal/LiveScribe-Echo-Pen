@@ -10,7 +10,7 @@ long paragraphs.
 
 | Original | Transcription (OCR output) | Correction (ground truth) |
 |---|---|---|
-| ![sample 05](samples/sample_05.png) | hones are attached<br>a<br>too-to-to-to-to-to-to-to-to-to-to-<br>O After that I need to determine<br>D. D. D.<br>if these switches are COR-enabled. | phones are attached to.<br><br>(5) After that I need to determine if these switches are CER-enabled. |
+| ![sample 05](samples/sample_05.png) | "hones are attached" / "a" / "too-to-to-..." / "O After that I need to determine" / "D. D. D." / "if these switches are COR-enabled." | "phones are attached to." / "(5) After that I need to determine if these switches are CER-enabled." |
 
 ## How to add a sample (workflow)
 
@@ -35,7 +35,9 @@ long paragraphs.
   convention, used consistently in every ground truth.
 - **Transcription column** must be the OCR's *actual* output, never
   cleaned up — that is the training signal. Corrections go in the third
-  column only.
+  column only. A `/` separator inside a cell marks a line break from
+  the original (Notepad's markdown renderer doesn't support multi-line
+  table cells).
 
 ## Misreads worth targeted training (so far)
 
