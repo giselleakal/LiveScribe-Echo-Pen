@@ -242,7 +242,7 @@ setup() {
     local want_models=0 extra=()
     for arg in "$@"; do
         case "$arg" in
-            --ocr) want_models=1; extra+=(tesseract-ocr) ;;
+            --ocr) want_models=1; extra+=(tesseract-ocr wamerican) ;;
             --stt) want_models=1 ;;
             *) echo "Unknown setup option: $arg (use --ocr / --stt)" >&2; exit 1 ;;
         esac
