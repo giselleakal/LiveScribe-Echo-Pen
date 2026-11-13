@@ -1,24 +1,33 @@
 #!/usr/bin/env bash
 # ./run — single entry point for the Echo notebook pipeline.
 #
-#   ./run               sync-free start: convert + serve (default)
+# First time on a machine:
+#   ./run setup         create .venv and check system packages; add --ocr
+#                        and/or --stt for handwriting and speech models
+#   ./run doctor        check everything; one fix line per problem
+#
+# Every day:
+#   ./run               convert (incremental) + serve on :8000 (default)
 #   ./run serve         same as above; extra args go to serve.py,
 #                        e.g. ./run serve --port 8010 --host 0.0.0.0
-#   ./run sync          full pen sync: build (if needed) -> download from
-#                        pen via dumpscribe -> convert. Then run ./run
-#                        (or ./run sync serve) to view.
+#   ./run sync          download from the pen (pen attached) -> convert;
+#                        then offers to clear the pen if all of it saved
 #   ./run sync serve    download from the pen, convert + serve in one go
-#   ./run convert       conversion only (no transcription)
-#   ./run ocr           OCR pages on demand
-#   ./run stt           transcribe session audio; pass --session PRS-… to
-#                        limit to one recording (never run automatically)
-#   ./run push          send notes to the Hermes echo-scribe webhook; pass
-#                        --page ID / --session ID to send one, --force to
-#                        re-send unchanged notes, --flush-only to drain the
-#                        queue. Requires ECHO_SCRIBE_SECRET to be set.
-#   ./run clean-pen     download the notebook, then delete it from the pen
-#                        (bulk, destructive; prompts for confirmation;
-#                        deletes only when pages AND audio downloaded)
+#
+# Transcription and export:
+#   ./run convert       conversion only (--force re-renders everything)
+#   ./run ocr           OCR pages (--ocr-profile legacy for the old OCR)
+#   ./run ocr-eval      score OCR against training/private/eval.json
+#   ./run stt           transcribe recordings; --session PRS-… for one
+#   ./run push          send notes to Hermes (needs ECHO_SCRIBE_SECRET);
+#                        --page ID / --session ID / --force / --flush-only
+#   ./run clean-pen     download, then DELETE everything from the pen
+#                        (prompts; only after pages AND audio downloaded)
+#
+# When something is wrong:
+#   ./run logs          recent log records; --errors, --run last, --json
+#   ./run debug-report  write a shareable report (no note content)
+#   ./run test          run the test suite
 #   ./run help          this message
 #
 # The pen only appears inside WSL after scripts/windows-connect.ps1 has
@@ -60,8 +69,10 @@ now_ms() {
     date +%s%3N
 }
 
+# Print the comment block at the top of this file: the one place the
+# commands are described.
 usage() {
-    sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 convert_only() {
@@ -207,6 +218,72 @@ clean_pen() {
     retire_pen
 }
 
+APT_PACKAGES=(build-essential pkg-config libglib2.0-dev libusb-1.0-0-dev
+    libopenobex2-dev libarchive-dev libxml2-dev libbluetooth-dev
+    python3-cairo python3-venv usbutils)
+
+missing_apt_packages() {
+    command -v dpkg-query >/dev/null || return 0
+    local pkg
+    for pkg in "${APT_PACKAGES[@]}" "$@"; do
+        dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed" \
+            || echo "$pkg"
+    done
+}
+
+# Idempotent machine setup: system packages (asks first), the project
+# .venv with system site-packages (for the system pycairo), and the
+# optional OCR / STT Python packages. Ends with ./run doctor.
+setup() {
+    local want_models=0 extra=()
+    for arg in "$@"; do
+        case "$arg" in
+            --ocr) want_models=1; extra+=(tesseract-ocr) ;;
+            --stt) want_models=1 ;;
+            *) echo "Unknown setup option: $arg (use --ocr / --stt)" >&2; exit 1 ;;
+        esac
+    done
+
+    local missing
+    missing="$(missing_apt_packages "${extra[@]}" | tr '\n' ' ')"
+    if [ -n "${missing// /}" ]; then
+        echo "Missing system packages: $missing"
+        if confirm "Install them with sudo apt?"; then
+            sudo apt-get update
+            # shellcheck disable=SC2086
+            sudo apt-get install -y $missing
+        else
+            echo "Skipping system packages; ./run doctor will list what is missing."
+        fi
+    fi
+
+    local sys_python
+    sys_python="$(command -v python3)"
+    if [ ! -x "$ROOT/.venv/bin/python" ]; then
+        echo "Creating .venv (with system site-packages, for pycairo)..."
+        "$sys_python" -m venv --system-site-packages "$ROOT/.venv"
+    elif ! grep -qi 'include-system-site-packages *= *true' "$ROOT/.venv/pyvenv.cfg"; then
+        echo "ERROR: .venv was created without --system-site-packages, so it can't see pycairo." >&2
+        echo "Remove it and run setup again:  rm -rf .venv && ./run setup" >&2
+        exit 1
+    fi
+    PYTHON="$ROOT/.venv/bin/python"
+
+    if [ "$want_models" -eq 1 ]; then
+        echo "Installing CPU PyTorch and the OCR/STT packages (large download)..."
+        "$PYTHON" -m pip install --upgrade pip
+        "$PYTHON" -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+        "$PYTHON" -m pip install -r "$ROOT/requirements.txt"
+    fi
+
+    if pkg-config --exists openobex 2>/dev/null; then
+        ensure_dumpscribe || echo "dumpscribe did not build; ./run doctor shows why."
+    fi
+    log_event setup.done models="$want_models"
+    echo
+    "$PYTHON" "$ROOT/src/doctor.py" || true
+}
+
 mode="${1:-}"
 case "$mode" in
     ""|serve)
@@ -235,6 +312,22 @@ case "$mode" in
     ocr-eval)
         shift
         exec "$PYTHON" "$ROOT/src/ocr_eval.py" "$@"
+        ;;
+    setup)
+        shift
+        setup "$@"
+        ;;
+    doctor)
+        shift
+        exec "$PYTHON" "$ROOT/src/doctor.py" "$@"
+        ;;
+    logs)
+        shift
+        exec "$PYTHON" "$ROOT/src/telemetry.py" logs "$@"
+        ;;
+    debug-report)
+        shift
+        exec "$PYTHON" "$ROOT/src/doctor.py" report "$@"
         ;;
     test)
         shift

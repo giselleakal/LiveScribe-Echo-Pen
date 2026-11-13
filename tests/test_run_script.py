@@ -1,8 +1,10 @@
 """Pen-safety rules of ./run, with lsusb, sudo and dumpscribe stubbed out."""
 import os
+import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -104,6 +106,50 @@ class RunScriptPenSafetyTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 3)
         self.assertIn("chown", calls)
         self.assertNotIn("convert", calls)
+
+
+class RunScriptSetupTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="echo-setup-test-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        shutil.copy(os.path.join(REPO, "run"), self.root)
+        os.makedirs(os.path.join(self.root, "bin"))
+        # no dpkg-query / pkg-config: the apt and build steps are skipped
+        for tool in ("dpkg-query", "pkg-config"):
+            write_exe(os.path.join(self.root, "bin", tool), "#!/bin/sh\nexit 1\n")
+
+    def run_setup(self):
+        env = dict(os.environ, PATH=os.path.join(self.root, "bin") +
+                   os.pathsep + os.environ["PATH"])
+        return subprocess.run([os.path.join(self.root, "run"), "setup"],
+                              input="", env=env, capture_output=True,
+                              text=True, timeout=120)
+
+    def test_setup_creates_a_venv_that_sees_system_packages(self):
+        proc = self.run_setup()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(os.path.join(self.root, ".venv", "pyvenv.cfg")) as f:
+            self.assertIn("include-system-site-packages = true", f.read())
+        self.assertEqual(self.run_setup().returncode, 0)   # idempotent
+
+    def test_setup_refuses_a_venv_without_system_packages(self):
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip",
+                        os.path.join(self.root, ".venv")], check=True)
+        proc = self.run_setup()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("rm -rf .venv", proc.stderr)
+
+
+class HelpTest(unittest.TestCase):
+    def test_help_lists_every_command_the_script_dispatches(self):
+        with open(os.path.join(REPO, "run")) as f:
+            script = f.read()
+        dispatched = re.findall(r"^    ([a-z][a-z-]*)\)$", script, re.M)
+        out = subprocess.run([os.path.join(REPO, "run"), "help"],
+                             capture_output=True, text=True,
+                             timeout=30).stdout
+        for command in dispatched:
+            self.assertIn("./run " + command, out, command)
 
 
 if __name__ == "__main__":

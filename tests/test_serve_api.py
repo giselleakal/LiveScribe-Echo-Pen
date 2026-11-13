@@ -9,7 +9,6 @@ from unittest import mock
 
 import convert
 import serve
-
 from tests import fixtures
 
 

@@ -4,7 +4,6 @@ import tempfile
 import unittest
 
 import convert
-
 import tests
 from tests import fixtures
 

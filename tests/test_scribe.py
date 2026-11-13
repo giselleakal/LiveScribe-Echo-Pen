@@ -7,7 +7,6 @@ import unittest
 from unittest import mock
 
 import scribe
-
 from tests import fixtures
 
 

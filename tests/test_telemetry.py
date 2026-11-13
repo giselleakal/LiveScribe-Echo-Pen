@@ -9,7 +9,6 @@ import unittest
 from unittest import mock
 
 import telemetry
-
 from tests import REPO, fixtures
 
 STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
@@ -134,7 +133,6 @@ class ServeRecordTest(unittest.TestCase):
         import http.client
 
         import serve
-
         from tests.test_serve_api import start_server
         fixtures.reset_sandbox()
         httpd = start_server("127.0.0.1")

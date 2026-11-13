@@ -3,7 +3,6 @@ import unittest
 import stt
 
 
-
 class ChunksTest(unittest.TestCase):
     def test_short_audio_is_one_window(self):
         audio = list(range(stt.SAMPLE_RATE * 5))

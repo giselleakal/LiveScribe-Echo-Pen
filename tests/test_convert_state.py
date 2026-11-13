@@ -10,10 +10,8 @@ import unittest
 from unittest import mock
 
 import convert
-
 import tests
 from tests import fixtures
-
 
 PAGE_A = "2208.1.12.25"
 PAGE_B = "2208.1.12.26"

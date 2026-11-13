@@ -10,7 +10,6 @@ from unittest import mock
 import convert
 import ocr
 import ocr_eval
-
 from tests import fixtures
 
 
