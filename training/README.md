@@ -25,6 +25,9 @@ Notepad shows the raw text underneath; edit there, read on GitHub.
    table row, and commits, then pushes so the GitHub view is current.
    The human fills in the Correction column (the ground truth) either
    directly or by telling the agent.
+   *The same table is mirrored on the repo's landing page (root
+   `README.md`) so it's visible the moment you open the project — the
+   agent keeps both copies in sync.*
 3. Edit this file in Notepad via the Windows path
    `\\wsl.localhost\Ubuntu\home\giselle\echo\training` — editing here
    edits the repo copy directly; the agent commits and pushes it.

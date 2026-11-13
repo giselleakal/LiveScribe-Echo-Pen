@@ -11,6 +11,16 @@ project, MIT license). A Python pipeline renders each written page to SVG
 handwriting, Tesseract as a lightweight fallback), and a stdlib-only HTTP
 server publishes them with full-text page search.
 
+## Handwriting recognition training
+
+Ground-truth pairs for improving the OCR: the original handwriting, what
+the OCR actually produced, and what it should have produced. Full doc:
+[`training/README.md`](training/README.md).
+
+| Original | Transcription | Correction |
+|---|---|---|
+| ![sample 05](training/samples/sample_05.png) | hones are attached<br>a<br>too-to-to-to-to-to-to-to-to-to-to-<br>O After that I need to determine<br>D. D. D.<br>if these switches are COR-enabled. | phones are attached to.<br><br>(5) After that I need to determine if these switches are CER-enabled. |
+
 ## Quick start
 
 If everything is already set up (see "Current machine state"):
