@@ -1,23 +1,33 @@
 #!/usr/bin/env bash
 # ./run — single entry point for the Echo notebook pipeline.
 #
-#   ./run               sync-free start: convert + serve (default)
+# First time on a machine:
+#   ./run setup         create .venv and check system packages; add --ocr
+#                        and/or --stt for handwriting and speech models
+#   ./run doctor        check everything; one fix line per problem
+#
+# Every day:
+#   ./run               convert (incremental) + serve on :8000 (default)
 #   ./run serve         same as above; extra args go to serve.py,
 #                        e.g. ./run serve --port 8010 --host 0.0.0.0
-#   ./run sync          full pen sync: build (if needed) -> download from
-#                        pen via dumpscribe -> convert. Then run ./run
-#                        (or ./run sync serve) to view.
+#   ./run sync          download from the pen (pen attached) -> convert;
+#                        then offers to clear the pen if all of it saved
 #   ./run sync serve    download from the pen, convert + serve in one go
-#   ./run convert       conversion only (no transcription)
-#   ./run ocr           OCR pages on demand
-#   ./run stt           transcribe session audio; pass --session PRS-… to
-#                        limit to one recording (never run automatically)
-#   ./run push          send notes to the Hermes echo-scribe webhook; pass
-#                        --page ID / --session ID to send one, --force to
-#                        re-send unchanged notes, --flush-only to drain the
-#                        queue. Requires ECHO_SCRIBE_SECRET to be set.
-#   ./run clean-pen     download the notebook, then delete it from the pen
-#                        (bulk, destructive; prompts for confirmation)
+#
+# Transcription and export:
+#   ./run convert       conversion only (--force re-renders everything)
+#   ./run ocr           OCR pages (--ocr-profile legacy for the old OCR)
+#   ./run ocr-eval      score OCR against training/private/eval.json
+#   ./run stt           transcribe recordings; --session PRS-… for one
+#   ./run push          send notes to Hermes (needs ECHO_SCRIBE_SECRET);
+#                        --page ID / --session ID / --force / --flush-only
+#   ./run clean-pen     download, then DELETE everything from the pen
+#                        (prompts; only after pages AND audio downloaded)
+#
+# When something is wrong:
+#   ./run logs          recent log records; --errors, --run last, --json
+#   ./run debug-report  write a shareable report (no note content)
+#   ./run test          run the test suite
 #   ./run help          this message
 #
 # The pen only appears inside WSL after scripts/windows-connect.ps1 has
@@ -42,8 +52,31 @@ else
     PYTHON="$(command -v python3)"
 fi
 
+# One correlation id for everything this invocation starts; every log
+# record in logs/echo.jsonl carries it (see ./run logs --run last).
+if [ -z "${ECHO_RUN_ID:-}" ]; then
+    ECHO_RUN_ID="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+fi
+export ECHO_RUN_ID
+
+# Keep logs/echo.jsonl bounded: rotated here, once per invocation, so the
+# processes writing to it never race to rotate it themselves.
+"$PYTHON" "$ROOT/src/telemetry.py" rotate >/dev/null 2>&1 || true
+
+# Record one structured event from bash; never fails the caller.
+#   log_event <event> [key=value ...] [--level WARNING]
+log_event() {
+    "$PYTHON" "$ROOT/src/telemetry.py" event run "$@" >/dev/null 2>&1 || true
+}
+
+now_ms() {
+    date +%s%3N
+}
+
+# Print the comment block at the top of this file: the one place the
+# commands are described.
 usage() {
-    sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 convert_only() {
@@ -59,86 +92,200 @@ serve() {
     exec "$PYTHON" "$ROOT/src/serve.py" "$@"
 }
 
-presetup() {
-    # 1. Confirm the pen is attached, with the exact Livescribe IDs.
-    if ! lsusb 2>/dev/null | grep -Eqi '1cfb:103[0-2]'; then
-        echo "ERROR: Livescribe pen not attached to WSL (expected 1cfb:1030/1031/1032 in lsusb)." >&2
-        echo "Run scripts/windows-connect.ps1 in an ADMIN PowerShell on Windows," >&2
-        echo "then confirm with: lsusb" >&2
-        exit 1
-    fi
-
-    # 2. Build the pen client if it is missing.
-    if [ ! -x "$ROOT/vendor/dumpscribe" ]; then
-        echo "Building dumpscribe..."
-        "$ROOT/scripts/build-dumpscribe.sh"
-    fi
-
-    # 3. Download from the pen (needs root for raw USB access) and hand
-    #    the dump back to this user.
-    echo "Syncing pen (runs as root to access the USB device)..."
-    local logfile
-    logfile="$(mktemp)"
-    # shellcheck disable=SC2024
-    sudo "$ROOT/vendor/dumpscribe" "$ROOT/data" 2>&1 | tee "$logfile"
-    # The pipeline exit status is dumpscribe's (pipefail), so a hard
-    # failure still stops here; the "audio download ok" marker tells us
-    # whether audio made it (so a later pen-clear offer is safe).
-    ECHO_AUDIO_OK=0
-    if grep -q '\[ECHO\] audio download ok' "$logfile"; then
-        ECHO_AUDIO_OK=1
-    fi
-    rm -f "$logfile"
-    sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
+pen_attached() {
+    lsusb 2>/dev/null | grep -Eqi '1cfb:103[0-2]'
 }
 
-# Offer to clear the pen after a successful, fully-downloaded sync.
-# Only when BOTH pages and audio are safe on disk (ECHO_AUDIO_OK) do we
-# suggest retiring the pen; otherwise a clear could delete pen audio that
-# was never backed up. Retire-only (-r) does NOT re-download: the sync
-# just made a fresh backup, so it wipes the pen and leaves local data
-# exactly as curated (deletions via the web UI stay deleted).
+require_pen() {
+    pen_attached && return 0
+    echo "ERROR: Livescribe pen not attached to WSL (expected 1cfb:1030/1031/1032 in lsusb)." >&2
+    echo "Run scripts/windows-connect.ps1 in an ADMIN PowerShell on Windows," >&2
+    echo "then confirm with: lsusb" >&2
+    exit 1
+}
+
+# Build the pen client when it is missing or older than its source, so a
+# pulled fix to dumpscribe.c is never silently skipped.
+ensure_dumpscribe() {
+    local bin="$ROOT/vendor/dumpscribe"
+    if [ -x "$bin" ] && [ "$bin" -nt "$ROOT/vendor/dumpscribe.c" ]; then
+        return 0
+    fi
+    echo "Building dumpscribe..."
+    "$ROOT/scripts/build-dumpscribe.sh"
+}
+
+# Hand data/ back to this user; runs after every sudo call, failed or not,
+# so a half-finished download never leaves root-owned files behind.
+own_data() {
+    if [ -d "$ROOT/data" ]; then
+        sudo chown -R "$(id -u):$(id -g)" "$ROOT/data" || true
+    fi
+}
+
+# Download everything from the pen into data/ (needs root for raw USB).
+# Sets ECHO_AUDIO_OK / ECHO_PAGES_OK from dumpscribe's "[ECHO] ... ok"
+# markers: together they mean the whole pen is backed up locally.
+download_from_pen() {
+    require_pen
+    ensure_dumpscribe
+    echo "Syncing pen (runs as root to access the USB device)..."
+    local logfile status started level
+    logfile="$(mktemp)"
+    started="$(now_ms)"
+    set +e
+    # shellcheck disable=SC2024
+    sudo "$ROOT/vendor/dumpscribe" "$ROOT/data" 2>&1 | tee "$logfile"
+    status=${PIPESTATUS[0]}
+    set -e
+    own_data
+    ECHO_AUDIO_OK=0
+    ECHO_PAGES_OK=0
+    grep -q '\[ECHO\] audio download ok' "$logfile" && ECHO_AUDIO_OK=1
+    grep -q '\[ECHO\] pages download ok' "$logfile" && ECHO_PAGES_OK=1
+    level=INFO
+    if [ "$status" -ne 0 ] || ! pen_fully_backed_up; then
+        level=WARNING
+    fi
+    log_event io target=dumpscribe mode=download \
+        status="$status" duration_ms="$(( $(now_ms) - started ))" \
+        audio_ok="$ECHO_AUDIO_OK" pages_ok="$ECHO_PAGES_OK" \
+        "output_tail=$(tail -c 400 "$logfile" | tr '\n' ' ')" --level "$level"
+    rm -f "$logfile"
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: pen download failed (dumpscribe exit $status); nothing was deleted from the pen." >&2
+        exit "$status"
+    fi
+}
+
+pen_fully_backed_up() {
+    [ "${ECHO_AUDIO_OK:-0}" -eq 1 ] && [ "${ECHO_PAGES_OK:-0}" -eq 1 ]
+}
+
+# Ask a y/N question; anything but yes (including no terminal) is no.
+confirm() {
+    local ans=""
+    read -r -p "$1 [y/N] " ans || ans=""
+    case "$ans" in
+        y|Y|yes|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Wipe every notebook (pages + audio) from the pen, without downloading.
+# Only ever called right after a download that saved everything.
+retire_pen() {
+    echo "Retiring pen (no re-download; local backup already safe)..."
+    local started status
+    started="$(now_ms)"
+    set +e
+    sudo "$ROOT/vendor/dumpscribe" -r "$ROOT/data"
+    status=$?
+    set -e
+    own_data
+    log_event io target=dumpscribe mode=retire status="$status" \
+        duration_ms="$(( $(now_ms) - started ))" \
+        --level "$([ "$status" -eq 0 ] && echo INFO || echo WARNING)"
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: clearing the pen failed (dumpscribe exit $status)." >&2
+        exit "$status"
+    fi
+    echo "Pen cleared."
+}
+
+# Offer to clear the pen after a sync, only when BOTH pages and audio are
+# safe on disk; otherwise a clear could delete notes that were never
+# backed up. Local data stays exactly as curated (web UI deletions stay).
 maybe_offer_clear_pen() {
-    [ "${ECHO_AUDIO_OK:-0}" -eq 1 ] || { echo "Not offering pen clear (audio didn't download — pen left as-is)."; return 0; }
-    while true; do
-        read -r -p "Sync complete. Pen audio + pages are saved locally. Clear them from the pen to free space? [y/N] " ans
-        case "$ans" in
-            y|Y|yes|Yes)
-                echo "Retiring pen (no re-download; local backup already safe). Ctrl+C to abort now..."
-                sudo "$ROOT/vendor/dumpscribe" -r "$ROOT/data"
-                sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
-                echo "Pen cleared."
-                break
-                ;;
-            n|N|no|No|"")
-                echo "Leaving the pen untouched."
-                break
-                ;;
-            *)
-                echo "Please answer y or N."
-                ;;
-        esac
+    if ! pen_fully_backed_up; then
+        echo "Not offering to clear the pen (not everything downloaded; pen left as-is)."
+        return 0
+    fi
+    if confirm "Sync complete. Pen audio + pages are saved locally. Clear them from the pen to free space?"; then
+        retire_pen
+    else
+        echo "Leaving the pen untouched."
+    fi
+}
+
+# Download everything, then delete it from the pen; refuses to delete
+# unless the download saved both pages and audio.
+clean_pen() {
+    require_pen
+    confirm "Download the notebook, then DELETE it from the pen?" || { echo "Aborted."; exit 1; }
+    download_from_pen
+    convert_only
+    if ! pen_fully_backed_up; then
+        echo "ERROR: not everything downloaded; refusing to delete anything from the pen." >&2
+        exit 1
+    fi
+    retire_pen
+}
+
+APT_PACKAGES=(build-essential pkg-config libglib2.0-dev libusb-1.0-0-dev
+    libopenobex2-dev libarchive-dev libxml2-dev libbluetooth-dev
+    python3-cairo python3-venv usbutils)
+
+missing_apt_packages() {
+    command -v dpkg-query >/dev/null || return 0
+    local pkg
+    for pkg in "${APT_PACKAGES[@]}" "$@"; do
+        dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed" \
+            || echo "$pkg"
     done
 }
 
-clean_pen() {
-    if [ ! -x "$ROOT/vendor/dumpscribe" ]; then
-        echo "Building dumpscribe..."
-        "$ROOT/scripts/build-dumpscribe.sh"
+# Idempotent machine setup: system packages (asks first), the project
+# .venv with system site-packages (for the system pycairo), and the
+# optional OCR / STT Python packages. Ends with ./run doctor.
+setup() {
+    local want_models=0 extra=()
+    for arg in "$@"; do
+        case "$arg" in
+            --ocr) want_models=1; extra+=(tesseract-ocr) ;;
+            --stt) want_models=1 ;;
+            *) echo "Unknown setup option: $arg (use --ocr / --stt)" >&2; exit 1 ;;
+        esac
+    done
+
+    local missing
+    missing="$(missing_apt_packages "${extra[@]}" | tr '\n' ' ')"
+    if [ -n "${missing// /}" ]; then
+        echo "Missing system packages: $missing"
+        if confirm "Install them with sudo apt?"; then
+            sudo apt-get update
+            # shellcheck disable=SC2086
+            sudo apt-get install -y $missing
+        else
+            echo "Skipping system packages; ./run doctor will list what is missing."
+        fi
     fi
-    if ! lsusb 2>/dev/null | grep -Eqi '1cfb:103[0-2]'; then
-        echo "ERROR: Livescribe pen not attached to WSL (expected 1cfb:1030/1031/1032)." >&2
+
+    local sys_python
+    sys_python="$(command -v python3)"
+    if [ ! -x "$ROOT/.venv/bin/python" ]; then
+        echo "Creating .venv (with system site-packages, for pycairo)..."
+        "$sys_python" -m venv --system-site-packages "$ROOT/.venv"
+    elif ! grep -qi 'include-system-site-packages *= *true' "$ROOT/.venv/pyvenv.cfg"; then
+        echo "ERROR: .venv was created without --system-site-packages, so it can't see pycairo." >&2
+        echo "Remove it and run setup again:  rm -rf .venv && ./run setup" >&2
         exit 1
     fi
-    read -r -p "Download the notebook, then DELETE it from the pen? [y/N] " ans
-    case "$ans" in
-        y|Y|yes|Yes) ;;
-        *) echo "Aborted."; exit 1 ;;
-    esac
-    echo "Downloading from pen and deleting from pen (runs as root)..."
-    sudo "$ROOT/vendor/dumpscribe" -c "$ROOT/data"
-    sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
-    convert_only
+    PYTHON="$ROOT/.venv/bin/python"
+
+    if [ "$want_models" -eq 1 ]; then
+        echo "Installing CPU PyTorch and the OCR/STT packages (large download)..."
+        "$PYTHON" -m pip install --upgrade pip
+        "$PYTHON" -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+        "$PYTHON" -m pip install -r "$ROOT/requirements.txt"
+    fi
+
+    if pkg-config --exists openobex 2>/dev/null; then
+        ensure_dumpscribe || echo "dumpscribe did not build; ./run doctor shows why."
+    fi
+    log_event setup.done models="$want_models"
+    echo
+    "$PYTHON" "$ROOT/src/doctor.py" || true
 }
 
 mode="${1:-}"
@@ -166,9 +313,33 @@ case "$mode" in
     clean-pen)
         clean_pen
         ;;
+    ocr-eval)
+        shift
+        exec "$PYTHON" "$ROOT/src/ocr_eval.py" "$@"
+        ;;
+    setup)
+        shift
+        setup "$@"
+        ;;
+    doctor)
+        shift
+        exec "$PYTHON" "$ROOT/src/doctor.py" "$@"
+        ;;
+    logs)
+        shift
+        exec "$PYTHON" "$ROOT/src/telemetry.py" logs "$@"
+        ;;
+    debug-report)
+        shift
+        exec "$PYTHON" "$ROOT/src/doctor.py" report "$@"
+        ;;
+    test)
+        shift
+        exec "$PYTHON" -m unittest discover -s "$ROOT/tests" -t "$ROOT" "$@"
+        ;;
     sync)
         shift
-        presetup
+        download_from_pen
         convert_only
         maybe_offer_clear_pen
         # optional passthrough: ./run sync serve --port 9000

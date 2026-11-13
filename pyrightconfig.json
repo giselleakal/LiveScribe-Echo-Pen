@@ -1,0 +1,9 @@
+{
+  "include": ["src", "tests", "scripts", "vendor"],
+  "extraPaths": ["src", "vendor"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "reportMissingModuleSource": "none"
+}

@@ -28,10 +28,9 @@ class BitReader(object):
     def get_bits(self, n=1):
         while n > self.nbits:
             x = self.stream.read(1)
-            if x == "":
-                print(self.nbits)
-                print("%x" % self.byte)
-                raise EOFError
+            if x == b"" or x == "":
+                raise EOFError("unexpected end of .stf stream mid-stroke "
+                               "(file is truncated?)")
 
             x = ord(x)
             self.byte = (self.byte << 8) | x
@@ -215,7 +214,9 @@ class STFParser(object):
                             time = br.get_bits(8)
                         elif header2 == 1:
                             time = br.get_bits(16)
-                        elif header2 == 2:
+                        elif header2 in (2, 3):
+                            # the header2 code table yields 0, 1 or 3;
+                            # 3 is the 32-bit time field
                             time = br.get_bits(32)
                         else:
                             print("bad stroke time header %d" % header2)
@@ -261,8 +262,7 @@ class STFParser(object):
 
                     self.handle_point(x0, y0, f0, point_time)
                     pass
-            except Exception as e:
-                print(e)
+            except Exception:
                 raise
         pass
 

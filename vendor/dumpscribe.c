@@ -776,6 +776,7 @@ int get_all_written_pages(obex_t* handle, long long int start_time,
   xmlChar* val;
   FILE* pagelistfile;
   int i, size;
+  int failures = 0;
   ssize_t written;
   char filepath[MAX_PATH_LENGTH];
 
@@ -850,7 +851,10 @@ int get_all_written_pages(obex_t* handle, long long int start_time,
     }
     debug("found notebook guid %s now retrievieving notebook pages\n", val);
 
-    get_notebook_pages(handle, BAD_CAST val, start_time, outfile, outdir, delete_after_get);
+    if(get_notebook_pages(handle, BAD_CAST val, start_time, outfile, outdir, delete_after_get) != 0) {
+      fprintf(stderr, "WARNING: failed to download notebook %s.\n", (char*) val);
+      failures++;
+    }
 
     xmlFree(val);
   }
@@ -859,6 +863,11 @@ int get_all_written_pages(obex_t* handle, long long int start_time,
   xmlXPathFreeContext(xpathCtx);
   xmlFreeDoc(doc);
   xmlCleanupParser();
+
+  // [ECHO] the pen may only be wiped when every notebook is safe on disk
+  if(failures == 0) {
+    printf("[ECHO] pages download ok\n");
+  }
   
   return 0;
 }
@@ -1060,6 +1069,11 @@ int main(int argc, char** argv) {
   if(ret) {
     fprintf(stderr, "WARNING: failed to download audio from smartpen (%d).\n"
                     "Continuing with pages; run STT/sync again to retry audio.\n", ret);
+    if(clean_mode) {
+      // [ECHO] never delete from the pen what was not downloaded
+      fprintf(stderr, "Not deleting anything from the pen: audio is not saved.\n");
+      clean_mode = 0;
+    }
   } else {
     printf("[ECHO] audio download ok\n");
   }

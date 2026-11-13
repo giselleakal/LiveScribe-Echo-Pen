@@ -26,3 +26,9 @@ test-inbox/
 
 # convert/serve run lock
 .convert.lock
+
+# structured logs (./run logs)
+logs/
+
+# handwriting samples and ground truth are notes: never committed
+training/private/

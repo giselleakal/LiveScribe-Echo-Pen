@@ -7,7 +7,7 @@ each step has a "you should see" note and a "trouble" fix at the bottom.
 > typed in the **Linux terminal (WSL)**, in the project folder, like this:
 >
 > ```
-> cd /home/giselle/echo
+> cd ~/echo
 > ./run sync
 > ```
 
@@ -28,7 +28,7 @@ each step has a "you should see" note and a "trouble" fix at the bottom.
    .\windows-connect.ps1
    ```
    (If drag-and-drop doesn't work: the folder is
-   `\\wsl.localhost\<distro>\home\giselle\echo\scripts` — navigate there in
+   `\\wsl.localhost\<distro>\home\<your-linux-user>\echo\scripts` — navigate there in
    PowerShell, or just use whatever path worked for you tonight.)
 3. Go back to the **Linux terminal** and check the pen is visible:
    ```
@@ -42,7 +42,7 @@ each step has a "you should see" note and a "trouble" fix at the bottom.
 ### Step 3 — Pull the notes off the pen and look at them
 In the Linux terminal, in the project folder:
 ```
-cd /home/giselle/echo
+cd ~/echo
 ./run sync
 ```
 - It may ask for a **sudo password** — that is **normal and expected**. Type
@@ -67,13 +67,15 @@ Then, to see your notes as a website:
 
 | Command | What it does | When to use |
 |---|---|---|
-| `cd /home/giselle/echo` | Go to the project folder | Every time you open a terminal |
+| `cd ~/echo` | Go to the project folder | Every time you open a terminal |
 | `./run sync` | Download notes from pen + render | After plugging pen in |
 | `./run` | Start the website (stays running) | To view notes |
 | `./run convert` | Just re-render pages (no pen needed) | After editing data |
 | `./run ocr` | Re-read handwriting into text | If pages lack transcription |
 | `./run stt` | Transcribe the audio recordings | On-demand |
 | `./run push` | Send notes to Hermes (my assistant) | When Hermes is set up |
+| `./run doctor` | Check that everything is set up; tells you the fix | When anything seems wrong |
+| `./run logs --errors` | Show the recent problems | After an error message |
 | `Ctrl + C` | Stop whatever is running | To quit the server |
 | `lsusb` | Check pen is attached | Step 2 check |
 | `clear` | Clean the terminal screen | When it gets messy |
@@ -83,7 +85,7 @@ Then, to see your notes as a website:
 ## Tomorrow night's plan (with the pen's new notes)
 
 1. Plug in pen → PowerShell bridge → `lsusb` check (Steps 1–2).
-2. `cd /home/giselle/echo` then `./run sync` → downloads the new notes.
+2. `cd ~/echo` then `./run sync` → downloads the new notes.
 3. `./run` → open **http://localhost:8000** → check the new pages appear.
 4. Then we'll work on the **transcription training**: teaching Hermes to read
    your handwriting better by reviewing/correcting the text.
@@ -94,13 +96,14 @@ Then, to see your notes as a website:
 
 | Problem | What to do |
 |---|---|
+| Anything at all | Run `./run doctor` first: every `!` line says what to type to fix it. |
 | `lsusb` shows no pen | Re-run the PowerShell bridge step. Try another cable. Check pen is on. |
 | `sudo` asks for password | Normal — type your Linux password, press Enter. |
 | Says "pen not attached" | The bridge step didn't stick; redo PowerShell step. |
 | Browser won't load localhost:8000 | Make sure `./run` is still running in the terminal. |
 | Terminal "stuck"/no prompt | That's usually the server running — press **Ctrl + C** to get your prompt back. |
 | Typed something wrong | Press the **↑ (up arrow)** to get the last command and fix it; **Tab** autocompletes. |
-| Everything's confusing | You can always ask me (in this chat) — I'll tell you exactly what to type. |
+| Everything's confusing | You can always ask me (in this chat) — I'll tell you exactly what to type. Running `./run debug-report` first gives me the details without any of your notes. |
 
 ---
 
@@ -110,6 +113,7 @@ Then, to see your notes as a website:
 3. **Ctrl + C** = stop whatever is running / get your prompt back.
 4. **You can't break the pen** — these commands only *read* notes off it
    (the one that deletes from the pen, `./run clean-pen`, is the ONLY one that
-   erases, and it asks you "y/N" first — say **N** unless you really mean it).
+   erases; it asks you "y/N" first, and it refuses to erase anything unless
+   your pages AND audio were saved first. Say **N** unless you really mean it).
 
 If you ever get lost: type `./run help` — it lists every command.

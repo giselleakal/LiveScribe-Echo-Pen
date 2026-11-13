@@ -22,12 +22,10 @@ Usage:
 """
 import argparse
 import base64
-import glob
 import hashlib
 import hmac
 import json
 import os
-import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -53,7 +51,19 @@ def verify_v2(secret, headers, body):
     return True, "ok"
 
 
+class ReceiverServer(ThreadingHTTPServer):
+    """The mock's shared state: inbox root, rate limit, pending chunks."""
+
+    def __init__(self, address, root, rate_limit=0):
+        super().__init__(address, Receiver)
+        self.root = os.path.abspath(root)
+        self.rate_limit = rate_limit
+        self.req_times = []
+        self.chunks = {}
+
+
 class Receiver(BaseHTTPRequestHandler):
+    server: ReceiverServer
     server_version = "MockEchoScribe/1.0"
     protocol_version = "HTTP/1.1"
 
@@ -74,7 +84,7 @@ class Receiver(BaseHTTPRequestHandler):
         if self.path.rstrip("/") != "/webhooks/echo-scribe":
             self.send_json(404, {"status": "unknown_route"})
             return
-        if getattr(self.server, "rate_limit", 0):
+        if self.server.rate_limit:
             self.server.req_times.append(time.time())
             recent = [t for t in self.server.req_times
                       if time.time() - t < 60]
@@ -128,7 +138,7 @@ def deliver(note_id, note, root):
     text = note.get("text") or ""
     transcript = note.get("transcription") or ""
     parts = []
-    components = [("note.md",
+    components: list = [("note.md",
                    "# %s\n\n## Text\n%s\n\n## Transcript\n%s\n"
                    % (title, text, transcript))]
     for i, svg in enumerate(note.get("svg_pages", []), 1):
@@ -167,11 +177,8 @@ def main():
     ap.add_argument("--root", default="test-inbox")
     ap.add_argument("--rate-limit", type=int, default=0)
     args = ap.parse_args()
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Receiver)
-    srv.root = os.path.abspath(args.root)
-    srv.rate_limit = args.rate_limit
-    srv.req_times = []
-    srv.chunks = {}
+    srv = ReceiverServer(("127.0.0.1", args.port), args.root,
+                         rate_limit=args.rate_limit)
     print("mock receiver on http://127.0.0.1:%d (root=%s)" % (args.port, srv.root))
     srv.serve_forever()
 

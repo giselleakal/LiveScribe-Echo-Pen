@@ -13,24 +13,27 @@ server publishes them with full-text page search.
 
 ## Handwriting recognition training
 
-Ground-truth pairs for improving the OCR: the original handwriting, what
-the OCR actually produced, and what it should have produced. Full doc:
-[`training/README.md`](training/README.md).
-
-| Original | Transcription | Correction |
-|---|---|---|
-| ![sample 05](training/samples/sample_05.png) | hones are attached<br>a<br>too-to-to-to-to-to-to-to-to-to-to-<br>O After that I need to determine<br>D. D. D.<br>if these switches are COR-enabled. | phones are attached to.<br><br>(5) After that I need to determine if these switches are CER-enabled. |
+How to measure and improve the OCR against pages you know the text of:
+[`training/README.md`](training/README.md). Samples and ground truth stay
+in the gitignored `training/private/`; notes never go in this repository.
 
 ## Quick start
 
-If everything is already set up (see "Current machine state"):
+First time on a machine (WSL Ubuntu):
+
+```sh
+./run setup --ocr --stt   # system packages (asks first), .venv, OCR/STT models
+./run doctor              # every line should be ✔ or an explained !
+```
+
+Every day:
 
 ```sh
 # 1. pen must be physically connected (data cable) and attached into WSL:
 #    run scripts/windows-connect.ps1 in an ADMIN PowerShell on Windows,
 #    then confirm:  lsusb   ->  1cfb:1032 Livescribe Echo(TM) Smartpen
 
-# 2. download notes from the pen and render pages (+ OCR if installed):
+# 2. download notes from the pen and render pages:
 ./run sync
 
 # 3. start the website (it serves output/ on port 8000):
@@ -38,15 +41,16 @@ If everything is already set up (see "Current machine state"):
 #    open http://localhost:8000 and use the search box
 ```
 
-`./run` converts (incrementally — unchanged pages are skipped) and then
+`./run` converts (incrementally: unchanged pages are skipped) and then
 serves the site in the foreground; press Ctrl+C to stop. Re-run
-`./run sync` anytime you have unsynced notes, then refresh the page;
-`./run convert` only renders, `./run ocr` forces the OCR pass again.
-Extra server options go after the command: `./run serve --port 8010`.
+`./run sync` any time you have unsynced notes, then refresh the page.
+`./run convert` only renders, and `./run ocr` runs the OCR pass. Extra server
+options go after the command: `./run serve --port 8010`. `./run help`
+lists every command.
 
 ## Architecture
 
-```
+```text
                      pen (1cfb:1032)
                             │  micro-USB data cable
    Windows  ────────────────┘   usbipd-win service
@@ -61,59 +65,56 @@ Extra server options go after the command: `./run serve --port 8010`.
                 └────── src/serve.py ──┘  (HTTP server)
 ```
 
-## Current machine state
+## Upgrading
 
-Everything on this machine is already installed and verified working:
+Pulled new code onto a machine that already has a library? Stop the
+running `./run`, pull, run `./run doctor`, and do the one-time steps in
+[`docs/upgrading.md`](docs/upgrading.md) for each change. Maintainers
+(people or agents) start from [`AGENTS.md`](AGENTS.md), which links the
+architecture and testing docs.
 
-- Windows: `usbipd-win` service running (the bridge).
-- WSL2 kernel: `vhci_hcd` loaded, `usbip` tools present.
-- Ubuntu packages: `obexftp`, `libopenobex2-dev`, `build-essential`,
-  `pkg-config`, `libglib2.0-dev`, `libusb-1.0-0-dev`, `libarchive-dev`,
-  `libxml2-dev`, `libbluetooth-dev`, `python3-cairo`.
-- The pen has been synced once: `data/` holds 7 written pages (.stf),
-  Paper Replay audio, and page templates; `output/` holds rendered pages.
-- `python3-cairo` renderer deps are installed. Start the site with
-  `./run` (converts, then binds localhost:8000; pass
-  `./run serve --host 0.0.0.0` to expose on the LAN).
-- OCR is ready: `tesseract` 5.3.4 is available via
-  `~/.local/bin/tesseract`, and `.venv` has TrOCR (CPU PyTorch +
-  transformers) with the `trocr-base-handwritten` model cached in
-  `~/.cache/huggingface`. `./run` uses TrOCR automatically.
+## Checking a machine
+
+`./run doctor` checks everything this README assumes and prints one fix
+per problem:
+
+- Python and the `.venv`
+- pycairo
+- the OCR and STT engines
+- the pen client build
+- whether the pen is attached
+- the library and incremental state
+- the run lock
+- push configuration
+- whether logs are writable
+
+Run it first whenever something seems off.
 
 ## First-time setup (one-time per machine)
 
-1. **Windows**: install [usbipd-win](https://github.com/dorssel/usbipd-win)
-   (already done here). Admin PowerShell is needed for bind/attach.
+1. **Windows**: install [usbipd-win](https://github.com/dorssel/usbipd-win).
+   Bind and attach need an admin PowerShell.
 
-2. **WSL**: install build/runtime deps:
+2. **WSL**: `./run setup` does the rest and is safe to re-run:
+   - lists missing apt packages and asks before installing them (the
+     build tools for the pen client, `python3-cairo`, `python3-venv`,
+     `usbutils`, and `tesseract-ocr` with `--ocr`)
+   - creates `.venv` with `--system-site-packages`, so it uses the system
+     pycairo
+   - with `--ocr` / `--stt`, installs CPU PyTorch and `requirements.txt`
+     (TrOCR and Moonshine; the models download on first use, ~1.3 GB)
+   - builds the pen client (`vendor/dumpscribe`)
+   - finishes with `./run doctor`
+
+   The manual equivalent, if you prefer:
+
    ```sh
    sudo apt install build-essential pkg-config libglib2.0-dev libusb-1.0-0-dev \
         libopenobex2-dev libarchive-dev libxml2-dev libbluetooth-dev python3-cairo
-   ```
-
-3. **Build the pen client**:
-   ```sh
    ./scripts/build-dumpscribe.sh
-   ```
-
-4. **Optional — install OCR** (for page transcriptions and search):
-
-   Tesseract is small but poor at cursive handwriting:
-   ```sh
-   sudo apt install tesseract-ocr
-   ```
-
-   For accurate handwriting, install the TrOCR backend in a project venv
-   (`--system-site-packages` keeps the system `pycairo`):
-   ```sh
    python3 -m venv --system-site-packages .venv
    .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
    .venv/bin/pip install -r requirements.txt
-   ```
-   The model downloads on first use (~1.3 GB). `./run` prefers the venv
-   automatically when it exists. To re-run just the conversion:
-   ```sh
-   .venv/bin/python src/convert.py --ocr
    ```
 
 ## Daily workflow
@@ -149,32 +150,55 @@ project `.venv` provides it, then falls back to `tesseract`. Override with
 `--ocr-engine tesseract` or `--ocr-engine trocr`.
 
 - TrOCR groups ink strokes into text lines, renders each line to
-  `output/pages/<page_id>/ocr-line-N.png`, and recognizes it. Tesseract
-  instead renders the whole page to `ocr.png`. Either way, the result is
-  written to `output/pages/<page_id>/text.txt`.
-- Recognized text is stored under the page's `text` key in
+  `output/pages/<page_id>/ocr-line-N.png` (very long lines are split at
+  word gaps into `ocr-line-N-M.png`), and recognizes each one. Tesseract
+  renders the inked area to `ocr.png` instead. Either way, the result is
+  written to `output/pages/<page_id>/text.txt` and to the page's `text` in
   `output/index.json`.
 - The web UI shows a "Transcription" disclosure and a "Download .txt"
   button per page, plus a search box that filters pages by id or text.
 
-Handwriting accuracy varies; the TrOCR backend handles cursive much
-better than Tesseract. Use `--ocr-lang eng+deu` (etc.) with Tesseract to
-recognize other languages.
+**Profiles.** `--ocr-profile` (or `ECHO_OCR_PROFILE`) chooses how lines are
+segmented and decoded:
+
+- `default` decodes TrOCR with beam search and blocks repeated phrases,
+  which stops the `to-to-to…` loops. It also splits very long lines and
+  keeps circles and brackets from starting lines of their own.
+- `legacy` is the original behaviour.
+
+The profile is part of each page's OCR record, so after changing it,
+`./run ocr` re-transcribes once.
+
+**Measuring accuracy.** `./run ocr-eval` scores the OCR against pages whose
+text you know: character and word error rates per sample. Compare
+`--profile legacy` with `--profile default` before trusting a change.
+Samples and ground truth live in the gitignored `training/private/`; see
+[`training/README.md`](training/README.md).
+
+`TROCR_MODEL=microsoft/trocr-large-handwritten` swaps in the larger, slower
+model. Use `--ocr-lang eng+deu` (etc.) with Tesseract for other languages.
 
 ## Incremental conversion and deletions
 
 `./run convert` keeps an incremental state file (`.convert-state.json`,
-gitignored): source files unchanged since the last run are skipped, and
-output whose source is gone from `data/` is pruned. Deleting a page
-directory or audio file from `data/` therefore makes it disappear from
-the site on the next convert.
+gitignored):
 
-Note: the pen itself still re-downloads everything on `./run sync` (the
-vendored dumpscribe has no per-asset skip), so removing a page from
-`data/` only sticks until the next real pen sync re-adds it. Deleting
-assets from the pen hardware is a `dumpscribe -c` bulk operation for
-whole notebooks, not per page/session (see `future_features/` for where
-this is headed).
+- Source files unchanged since the last run are skipped.
+- Output whose source is gone from `data/` is pruned, so deleting a page
+  directory or audio file from `data/` makes it disappear from the site
+  on the next convert.
+- `--force` re-renders everything but keeps transcriptions, transcripts
+  and capture times of unchanged ink.
+- The state is saved after each page OCR'd and each recording
+  transcribed, so an interrupted run keeps its finished work.
+- A corrupt or truncated page file is skipped with a warning, and keeps
+  its last good render.
+
+Note: the pen still re-downloads everything on `./run sync`, because the
+vendored dumpscribe has no per-asset skip. So removing a page from `data/`
+only sticks until the next real sync re-adds it, unless the pen is cleared
+afterwards. `./run sync` offers to clear the pen, and `./run clean-pen`
+does it; both refuse unless the download saved **both** pages and audio.
 
 ## Push notes to Hermes
 
@@ -196,6 +220,9 @@ export ECHO_SCRIBE_SECRET="<secret from /opt/data/inbox/echo-scribe/WEBHOOK.md>"
 ./run push --flush-only          # just drain any queued notes
 ```
 
+`./run push` exits 2 when `ECHO_SCRIBE_SECRET` is missing and 1 when some
+notes were parked, so scripts notice either.
+
 Push is rsync-style: `.push-state.json` records a content signature per
 `note_id`, so notes you've already sent unchanged are skipped. Unreachable
 notes are parked on disk (`output/push-queue/`, gitignored) and re-sent on a
@@ -213,27 +240,46 @@ card (same signing/dedup path). Config is via environment:
 
 ## Project layout
 
-```
-data/      raw output of dumpscribe  (gitignored)
-output/    generated site content    (gitignored)
-scripts/   windows-connect.ps1, build-dumpscribe.sh
-src/       convert.py, ocr.py, serve.py (project code)
+```text
+data/      raw output of dumpscribe              (gitignored)
+output/    generated site content                (gitignored)
+logs/      structured logs, debug reports        (gitignored)
+docs/      for maintainers: architecture, testing, upgrading an install
+scripts/   windows-connect.ps1, build-dumpscribe.sh, check-dumpscribe.sh,
+           push test harness
+src/       convert.py (pipeline), serve.py (web), ocr.py + ocr_eval.py,
+           stt.py, scribe.py (Hermes push), telemetry.py (logs),
+           doctor.py (checks, debug report), paths.py (ECHO_ROOT)
+tests/     stdlib unittest suite + synthetic pen data (./run test)
+training/  how to measure OCR; private/ holds samples (gitignored)
 vendor/    dumpscribe.c + parsestf.py (MIT, from CounterCultureLabs)
-run        one-shot entry point: convert + serve (./run, ./run sync)
-requirements-core.txt / requirements.txt   core / OCR dep lists
-.venv/     optional TrOCR backend + CPU PyTorch (gitignored)
+.agents/   agent skills: add-feature, debug
+run        the one entry point (./run help)
+requirements-core.txt / requirements.txt   core / OCR+STT dep lists
 future_features/   written specs for planned-but-not-built features
 ```
 
 ## Troubleshooting
 
+Start with `./run doctor`. Then:
+
+- `./run logs --errors` shows recent warnings and errors.
+- `./run logs --run last` shows everything from the latest command.
+- `./run debug-report` writes a shareable summary with no note content.
+
+Agents can use the `debug` skill (`.agents/skills/debug/`).
+
 - **`lsusb` empty in WSL**: the pen is not attached. Re-run the
-  `windows-connect.ps1` step; verify it appears in `usbipd list` first
-  (admin PowerShell). If the cable is unknown, try another data cable.
+  `windows-connect.ps1` step (it now reports bind/attach failures), and
+  check that the pen appears in `usbipd list` first (admin PowerShell). If
+  you aren't sure about the cable, try another data cable.
 - **`usbipd bind` fails with a USBPcap warning**: use `--force`
   (the script already does).
-- **`sudo` prompts in `./run sync`**: that is expected — the pen client needs
-  read/write access to `/dev/bus/usb`. The dataset is chowned back to you.
+- **`sudo` prompts in `./run sync`**: that is expected. The pen client
+  needs read/write access to `/dev/bus/usb`, and the dataset is chowned
+  back to you even when the download fails.
+- **"Another convert is running"**: a convert or the web server is busy.
+  `./run doctor` shows the pid. A crashed run never leaves a stale lock.
 - **Pencil lead icon / HID mouse moves**: harmless; the pen's low-level
   HID interface is unused by this pipeline.
 

@@ -1,62 +1,74 @@
 # Handwriting recognition training materials
 
-Ground-truth pairs for improving the pipeline's OCR (`src/ocr.py`,
-tesseract): each row pairs the original handwriting image with what
-the OCR actually produced and what it *should* have produced. Keep one
-row per sample; more samples of the same misread word are worth more
-than long paragraphs.
+How to measure and improve the pipeline's OCR (`src/ocr.py`) against
+pages whose correct text you know. `./run ocr-eval` scores the OCR with
+character and word error rates (CER/WER) before and after a change.
 
-**Reading this file:** the pretty, fully rendered version lives on
-GitHub — `training/README.md` in `giselleakal/LiveScribe-Echo-Pen`.
-Notepad shows the raw text underneath; edit there, read on GitHub.
+## Notes never go in the repository
 
-## Training table
+This repository is public, and everything committed stays in its history.
+Samples, page images and ground-truth text are your notes, so they live in
+`training/private/`, which git ignores. Only this README is tracked.
 
-| Original | Transcription | Correction |
-|---|---|---|
-| ![sample 05](samples/sample_05.png) | hones are attached<br>a<br>too-to-to-to-to-to-to-to-to-to-to-<br>O After that I need to determine<br>D. D. D.<br>if these switches are COR-enabled. | phones are attached to.<br><br>(5) After that I need to determine if these switches are CER-enabled. |
+## Evaluation manifest
 
-## How to add a sample (workflow)
+`training/private/eval.json` (or any file passed to `--manifest`) lists
+the samples:
 
-1. **Save the handwriting image** to Windows `Downloads`
-   (`C:\Users\gisel\Downloads\`). PNG preferred; any readable image works.
-2. **Tell the agent** "new sample in Downloads" — it copies the image
-   into `samples/`, runs the OCR to fill the middle column, adds the
-   table row, and commits, then pushes so the GitHub view is current.
-   The human fills in the Correction column (the ground truth) either
-   directly or by telling the agent.
-   *The same table is mirrored on the repo's landing page (root
-   `README.md`) so it's visible the moment you open the project — the
-   agent keeps both copies in sync.*
-3. Edit this file in Notepad via the Windows path
-   `\\wsl.localhost\Ubuntu\home\giselle\echo\training` — editing here
-   edits the repo copy directly; the agent commits and pushes it.
-4. **Read the rendered version** on GitHub (refresh the page after the
-   agent pushes).
+```json
+{
+  "samples": [
+    {"id": "fox", "page": "2208.1.12.25",
+     "truth": "the quick brown fox\njumps over the lazy dog"},
+    {"id": "digits", "image": "digits.png",
+     "truth": "0 1 2 3 4 5 6 7 8 9"}
+  ]
+}
+```
+
+- `page`: a page id from the library (the id shown on the page card).
+  The page's strokes are read from `data/` and run through the full
+  pipeline: line grouping, line rendering, recognition. Use this to
+  measure real accuracy.
+- `image`: a single *line* of handwriting as an image, with its path
+  relative to the manifest. It goes straight to the recognizer and skips
+  line grouping. Use it to compare recognizers or decoding settings.
+- `truth`: the correct transcription. Separate lines with `\n`.
+
+Run it:
+
+```sh
+./run ocr-eval                        # default profile
+./run ocr-eval --profile legacy       # the previous OCR behaviour, to compare
+./run ocr-eval --engine tesseract
+./run ocr-eval --json                 # machine-readable
+```
+
+Lower CER/WER is better. Compare profiles on the same manifest before
+changing a default.
+
+## How to add a sample
+
+1. Write on Echo dot paper, then `./run sync` so the page is in the library.
+2. Find its page id on the page card in the web UI.
+3. Add an entry to `training/private/eval.json` with the id and the exact
+   text you wrote.
+4. Run `./run ocr-eval`.
 
 ## Conventions
 
-- **Sample naming:** sample number = the `NN` in the source page's
-  `Notes_Mmm_DD_NN_…` filename (Nov 12 page 05 → `sample_05.png`), so
-  every sample's name points straight back to the page it came from.
-  Page titles in the library (`Notes_Nov_12_01`…`05`) follow the same
-  scheme, so UI title ↔ sample file ↔ table row all agree.
-- **Circled numbers:** transcribe the circled ⑤ as `(5)` — one
-  convention, used consistently in every ground truth.
-- **Transcription column** must be the OCR's *actual* output, never
-  cleaned up — that is the training signal. Corrections go in the third
-  column only. `<br>` inside a cell marks a line break; it renders as
-  a line break on GitHub but shows as literal text in Notepad.
+- **Circled numbers:** transcribe a circled ⑤ as `(5)`, and do it the
+  same way in every ground truth.
+- **Ground truth is what was written**, misspellings included. The OCR is
+  scored against it as-is.
+- **Line breaks:** one `\n` per written line, so line-grouping errors show
+  up in the score.
 
 ## Misreads worth targeted training (so far)
 
-- `ph` → `h`, `phones` → `hones`
-- `5` → `O` / `to`
-- `CER` → `COR` / `D.`
-- Short function words after a line break are worst; connected-cursive
-  phrases (determine, switches, attached) survive best.
-
-## Per-sample sources
-
-- **Sample 05** — `Notes_Nov_12_05_Image_OCR.png` (Windows Downloads),
-  written on Echo dot paper, 2026-11-12.
+- A leading `ph` read as `h`.
+- Circled digits read as letters or short words (`O`, `to`).
+- Capitalised acronyms swapped for similar letters.
+- TrOCR sometimes loops, repeating one short token across the line.
+- Short function words right after a line break are worst; long words
+  in connected cursive survive best.

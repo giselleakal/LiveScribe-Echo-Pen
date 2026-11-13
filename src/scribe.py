@@ -36,18 +36,24 @@ import hmac
 import json
 import os
 import re
+import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-OUT = os.path.join(ROOT, "output")
+import paths
+import telemetry
+
+log = telemetry.get_logger("push")
+
+ROOT = paths.ROOT
+OUT = paths.OUT
 PAGES_OUT = os.path.join(OUT, "pages")
 AUDIO_OUT = os.path.join(OUT, "audio")
-DATA_DIR = os.path.join(ROOT, "data")
+DATA_DIR = paths.DATA
 INDEX = os.path.join(OUT, "index.json")
 
 STATE_PATH = os.path.join(ROOT, ".push-state.json")
@@ -57,8 +63,13 @@ URL_DEFAULT = os.environ.get("ECHO_SCRIBE_URL",
                              "http://127.0.0.1:8644/webhooks/echo-scribe")
 
 CHUNK_CHAR_LIMIT = 600000   # slice serialized payloads above this
+MAX_BODY_BYTES = 950000     # receiver caps requests at 1 MB; keep a margin
 MAX_ATTEMPTS = 3            # exponential backoff ceiling for the queue
 BACKOFF_BASE = 2.0          # seconds
+
+# web UI clicks run in parallel threads; queue and state are read-modify-
+# write files, so one push or flush runs at a time
+_push_lock = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -130,24 +141,33 @@ def _parse_offset(s):
 
 
 def _render_zone(dt):
-    """Render a datetime in ECHO_TZ / ECHO_UTC_OFFSET (UTC fallback)."""
+    """Render a datetime in ECHO_TZ / ECHO_UTC_OFFSET (UTC fallback).
+
+    ECHO_TZ wins; an unknown zone name falls through to the offset.
+    """
     tz_name = os.environ.get("ECHO_TZ")
-    off = os.environ.get("ECHO_UTC_OFFSET")
     if tz_name:
         try:
             from zoneinfo import ZoneInfo
             return dt.astimezone(ZoneInfo(tz_name))
         except Exception:
-            pass
-    elif off and _parse_offset(off):
-        return dt.astimezone(_parse_offset(off))
+            print("warning: unknown ECHO_TZ %r; using ECHO_UTC_OFFSET/UTC"
+                  % tz_name, file=sys.stderr)
+    off = _parse_offset(os.environ.get("ECHO_UTC_OFFSET") or "")
+    if off:
+        return dt.astimezone(off)
     return dt
+
+
+def _rfc3339(dt):
+    """2023-11-14T17:13:20-05:00 (offset with a colon, as RFC 3339 needs)."""
+    return dt.isoformat(timespec="seconds")
 
 
 def recorded_at(mtime):
     """ISO 8601 with a UTC offset, from a Unix mtime."""
-    return _render_zone(datetime.datetime.fromtimestamp(
-        mtime, datetime.timezone.utc)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    return _rfc3339(_render_zone(datetime.datetime.fromtimestamp(
+        mtime, datetime.timezone.utc)))
 
 
 def recorded_at_iso(iso):
@@ -160,7 +180,7 @@ def recorded_at_iso(iso):
         dt = datetime.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S%z")
     except (TypeError, ValueError):
         return None
-    return _render_zone(dt).strftime("%Y-%m-%dT%H:%M:%S%z")
+    return _rfc3339(_render_zone(dt))
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +342,18 @@ def post_body(body, url, secret, request_id, ts=None):
             "X-Request-ID": request_id,
             "User-Agent": "echo-notebook/1.0",
         })
+    with telemetry.io_call(log, "hermes", url=url,
+                           hermes_request_id=request_id,
+                           bytes=len(body)) as call:
+        status, reply = _post(req)
+        call["status"] = status
+        call["outcome"] = classify(status)
+        if status != 200:
+            call["reply_tail"] = telemetry.tail(reply, 300)
+    return status, reply
+
+
+def _post(req):
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.status, resp.read()
@@ -348,27 +380,46 @@ def classify(status):
     return "server"
 
 
-def send_payload(serialized, note_id, url, secret, request_id):
-    """Send one serialized note, chunking if needed. Returns (ok, message).
+def chunk_bodies(serialized, note_id):
+    """Request bodies for one note: the note itself, or signed-size slices.
 
-    ``ok``      True if the receiver accepted every slice.
-    ``message`` human-readable result for the CLI / UI.
+    Slices are cut by characters but sized so every encoded envelope stays
+    under MAX_BODY_BYTES, whatever the escaping and UTF-8 expansion.
     """
-    if len(serialized) <= CHUNK_CHAR_LIMIT:
-        status, _ = post_body(serialized.encode("utf-8"),
-                              url, secret, request_id)
-        return classify(status) == "ok", classify(status)
-    total = (len(serialized) + CHUNK_CHAR_LIMIT - 1) // CHUNK_CHAR_LIMIT
-    for i in range(total):
-        sl = serialized[i * CHUNK_CHAR_LIMIT:(i + 1) * CHUNK_CHAR_LIMIT]
-        chunk = {"__chunk": {"id": note_id, "index": i,
-                             "total": total, "data": sl}}
-        body = json.dumps(chunk, ensure_ascii=False,
-                          separators=(",", ":")).encode("utf-8")
+    whole = serialized.encode("utf-8")
+    if len(serialized) <= CHUNK_CHAR_LIMIT and len(whole) <= MAX_BODY_BYTES:
+        return [whole]
+    size = CHUNK_CHAR_LIMIT
+    while True:
+        total = (len(serialized) + size - 1) // size
+        bodies = [json.dumps({"__chunk": {
+            "id": note_id, "index": i, "total": total,
+            "data": serialized[i * size:(i + 1) * size]}},
+            ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            for i in range(total)]
+        largest = max(len(b) for b in bodies)
+        if largest <= MAX_BODY_BYTES:
+            return bodies
+        size = max(1, int(size * MAX_BODY_BYTES / largest * 0.95))
+
+
+def send_payload(serialized, note_id, url, secret, request_id):
+    """Send one serialized note, chunking if needed. Returns (ok, cls).
+
+    ``cls`` is the classify() result of the last request: "ok" when the
+    receiver accepted every slice, else the failure class.
+    """
+    for body in chunk_bodies(serialized, note_id):
         status, _ = post_body(body, url, secret, request_id)
-        if status != 200:
-            return False, "chunk %d/%d rejected (%d)" % (i + 1, total, status)
-    return True, "chunked (%d slices)" % total
+        cls = classify(status)
+        if cls != "ok":
+            return False, cls
+    return True, "ok"
+
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z")
 
 
 # ---------------------------------------------------------------------------
@@ -385,57 +436,86 @@ def enqueue(note_id, payload):
     atomic_write(_queue_path(note_id), payload)
 
 
+def _read_queued(path):
+    """A queue entry, or None when it is unreadable or incomplete."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            q = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(q, dict) or not q.get("id") or \
+            not isinstance(q.get("payload"), str):
+        return None
+    return q
+
+
+def _deliver(q, url, secret):
+    """Send one queued note with backoff on 5xx/429; returns (ok, cls)."""
+    request_id = q.get("request_id") or str(uuid.uuid4())
+    q["request_id"] = request_id
+    ok, cls = send_payload(q["payload"], q["id"], url, secret, request_id)
+    delay = BACKOFF_BASE
+    attempt = 0
+    while not ok and cls in ("server", "rate") and attempt < MAX_ATTEMPTS:
+        time.sleep(delay)
+        delay *= 2
+        attempt += 1
+        ok, cls = send_payload(q["payload"], q["id"], url, secret, request_id)
+    return ok, cls
+
+
 def flush_queue(url=URL_DEFAULT, secret=None):
     """Send every queued note. Returns (sent, parked_ids, messages).
 
-    network-unreachable parks immediately (the next flush retries);
-    5xx/429 get exponential backoff (MAX_ATTEMPTS); 401/413 are surfaced
-    and left parked (no blind retry). Survives restart.
+    ``messages`` lists (note_id, cls) for each parked note. An unreachable
+    receiver parks the note and ends the flush (the rest stay queued for
+    the next one); 5xx/429 get exponential backoff (MAX_ATTEMPTS); 401/413
+    are surfaced and left parked (no blind retry). Survives restart.
     """
     if secret is None:
         secret = os.environ.get("ECHO_SCRIBE_SECRET")
     if not secret:
-        return 0, [], {"config": "ECHO_SCRIBE_SECRET is not set"}
+        return 0, [], [(None, "config")]
+    with _push_lock:
+        return _flush_locked(url, secret)
+
+
+def _flush_locked(url, secret):
     state = load_state()
     sent = 0
     parked = []
     messages = []
     queued = sorted(glob.glob(os.path.join(QUEUE_DIR, "*.json")),
                     key=os.path.basename)
-    for path in queued:
-        try:
-            with open(path, encoding="utf-8") as f:
-                q = json.load(f)
-        except (OSError, ValueError):
+    for n, path in enumerate(queued):
+        q = _read_queued(path)
+        if q is None:
             parked.append(os.path.basename(path))
             continue
-        note_id = q.get("id")
-        ok, cls = send_payload(q["payload"], note_id, url, secret,
-                               q.get("request_id") or str(uuid.uuid4()))
-        delay = BACKOFF_BASE
-        attempt = 0
-        while not ok and cls in ("server", "rate") and attempt < MAX_ATTEMPTS:
-            time.sleep(delay)
-            delay *= 2
-            attempt += 1
-            ok, cls = send_payload(q["payload"], note_id, url, secret,
-                                   q.get("request_id"))
-        if ok:
-            state["notes"].setdefault(note_id, {})
-            state["notes"][note_id].update(
-                {"accepted": True, "request_id": q.get("request_id"),
-                 "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                 "sig": q.get("sig")})
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            sent += 1
-        else:
+        note_id = q["id"]
+        ok, cls = _deliver(q, url, secret)
+        if not ok:
             parked.append(note_id)
-            messages.append((note_id, "parked: %s" % cls))
+            messages.append((note_id, cls))
+            if cls == "net":
+                parked.extend(_queued_id(p) for p in queued[n + 1:])
+                break
+            continue
+        state["notes"].setdefault(note_id, {})
+        state["notes"][note_id].update(
+            {"accepted": True, "request_id": q["request_id"],
+             "pushed_at": _utc_now(), "sig": q.get("sig")})
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        sent += 1
         save_state(state)
     return sent, parked, messages
+
+
+def _queued_id(path):
+    return os.path.splitext(os.path.basename(path))[0]
 
 
 # ---------------------------------------------------------------------------
@@ -453,15 +533,20 @@ def push_targets(specs, force=False):
     Honors dedup: unchanged, already-accepted notes are skipped unless
     ``force``.
     """
+    secret = os.environ.get("ECHO_SCRIBE_SECRET")
+    if not secret:
+        return {}, {"config": "ECHO_SCRIBE_SECRET is not set"}
+    with _push_lock:
+        return _push_locked(specs, force, secret)
+
+
+def _push_locked(specs, force, secret):
     index = load_index()
     pages_by_id = {p["id"]: p for p in index.get("pages", [])}
     sessions_by_id = {s["id"]: s for s in index.get("sessions", [])}
     state = load_state()
     results = {}
     url = os.environ.get("ECHO_SCRIBE_URL", URL_DEFAULT)
-    secret = os.environ.get("ECHO_SCRIBE_SECRET")
-    if not secret:
-        return results, {"config": "ECHO_SCRIBE_SECRET is not set"}
     for kind, ident in specs:
         if kind == "page":
             page = pages_by_id.get(ident)
@@ -485,7 +570,11 @@ def push_targets(specs, force=False):
             continue
         serialized = json.dumps(payload, ensure_ascii=False,
                                 separators=(",", ":"))
-        request_id = (prev or {}).get("request_id") or str(uuid.uuid4())
+        # one id per version of a note: a retry of the same content keeps
+        # it (the receiver dedupes for 1h), changed content gets a new one
+        same_content = bool(prev) and prev.get("sig") == sig
+        request_id = (prev or {}).get("request_id") if same_content else None
+        request_id = request_id or str(uuid.uuid4())
         enqueue(ident, json.dumps({
             "kind": kind, "id": ident, "sig": sig, "request_id": request_id,
             "payload": serialized,
@@ -495,6 +584,9 @@ def push_targets(specs, force=False):
         results[ident] = "queued for %s" % title
     save_state(state)
     sent, parked, msgs = flush_queue(url, secret)
+    log.info("push.done", extra={"targets": len(specs), "sent": sent,
+                                 "parked": len(parked),
+                                 "parked_classes": dict(msgs)})
     # flush_queue wrote its own accepted flags; reload to report accurately
     state = load_state()
     summary = {"sent": sent, "parked": parked, "messages": msgs}
@@ -553,10 +645,15 @@ def main(argv=None):
                     help="just drain the pending queue, build nothing")
     args = ap.parse_args(argv)
 
+    if not _is_configured():
+        print("error: ECHO_SCRIBE_SECRET is not set (put it in .env); "
+              "nothing was sent", file=sys.stderr)
+        return 2
+
     if args.flush_only:
         sent, parked, msgs = flush_queue()
         print("flushed: sent=%d parked=%s" % (sent, len(parked)))
-        return 0
+        return 1 if parked else 0
 
     index = load_index()
     pages = index.get("pages", [])
@@ -574,9 +671,11 @@ def main(argv=None):
     results, summary = push_targets(specs, force=args.force)
     for note_id, msg in results.items():
         print("%-12s %s" % (note_id, msg))
-    print("sent=%d parked=%d" % (summary.get("sent", 0),
-                                  len(summary.get("parked", []))))
-    return 0
+    parked = summary.get("parked", [])
+    print("sent=%d parked=%d" % (summary.get("sent", 0), len(parked)))
+    for note_id, cls in summary.get("messages", []):
+        print("parked %s: %s" % (note_id, cls), file=sys.stderr)
+    return 1 if parked else 0
 
 
 if __name__ == "__main__":
