@@ -262,8 +262,7 @@ class STFParser(object):
 
                     self.handle_point(x0, y0, f0, point_time)
                     pass
-            except Exception as e:
-                print(e)
+            except Exception:
                 raise
         pass
 

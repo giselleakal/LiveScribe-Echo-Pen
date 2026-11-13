@@ -48,11 +48,12 @@ SECRET_KEYS = ("secret", "token", "password", "authorization", "cookie",
 _STANDARD_ATTRS = set(vars(logging.LogRecord(
     "x", logging.INFO, "x", 0, "x", None, None))) | {"message", "asctime"}
 
-# injectable clocks: tests replace these to control durations and stamps
+# injectable clock for durations; tests replace it. Record timestamps come
+# from the logging module's own wall-clock stamp (record.created).
 monotonic = time.monotonic
-wall_clock = time.time
 
 _configured = False
+_configure_lock = threading.Lock()
 _context = threading.local()   # per-thread fields, e.g. serve's request_id
 
 
@@ -168,7 +169,9 @@ class JsonFormatter(logging.Formatter):
 
 
 class HumanFormatter(logging.Formatter):
-    """``warning: <event> (key=value, ...)`` for the terminal."""
+    """A terminal line: the record's ``detail`` sentence when it has one
+    (``warning: page 1.2 could not be converted ...``), else
+    ``warning: <event> (key=value, ...)``."""
 
     def format(self, record):
         fields = {k: v for k, v in vars(record).items()
@@ -197,9 +200,14 @@ def configure():
     pipeline.
     """
     global _configured
-    if _configured:
-        return
-    _configured = True
+    with _configure_lock:
+        if _configured:
+            return
+        _configured = True
+        _attach_handlers()
+
+
+def _attach_handlers():
     run_id()
     logging.raiseExceptions = False
     root = logging.getLogger("echo")

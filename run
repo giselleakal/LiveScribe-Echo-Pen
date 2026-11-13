@@ -232,6 +232,10 @@ case "$mode" in
     clean-pen)
         clean_pen
         ;;
+    ocr-eval)
+        shift
+        exec "$PYTHON" "$ROOT/src/ocr_eval.py" "$@"
+        ;;
     test)
         shift
         exec "$PYTHON" -m unittest discover -s "$ROOT/tests" -t "$ROOT" "$@"

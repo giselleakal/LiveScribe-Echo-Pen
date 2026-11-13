@@ -12,11 +12,18 @@ Two backends are supported:
 The Tesseract backend is a subprocess wrapper; the TrOCR backend imports
 ``torch``/``transformers`` lazily so the base pipeline still runs without
 them.
+
+How pages are segmented and decoded is chosen by a named *profile*
+(``ECHO_OCR_PROFILE`` or ``--ocr-profile``). ``legacy`` reproduces the
+original behaviour exactly, so ``./run ocr-eval`` can compare the two on
+the same samples before a default changes.
 """
+import dataclasses
 import logging
 import os
 import shutil
 import subprocess
+import threading
 
 import telemetry
 
@@ -27,6 +34,48 @@ TROCR_MODEL = os.environ.get(
     "TROCR_MODEL", "microsoft/trocr-base-handwritten")
 
 _trocr = None
+_trocr_lock = threading.Lock()   # the model is loaded once per process
+
+
+@dataclasses.dataclass(frozen=True)
+class Profile:
+    """Segmentation and decoding choices that affect recognized text."""
+    name: str
+    beams: int                 # TrOCR beam width; 1 is greedy decoding
+    no_repeat_ngram: int       # block repeated n-grams (0 = off); stops loops
+    max_line_aspect: "float | None"   # split wider lines at word gaps
+    oversize_ratio: "float | None"    # taller strokes don't start a line
+    tesseract_on_ink: bool     # render only the inked area for Tesseract
+
+
+PROFILES = {
+    "default": Profile("default", beams=4, no_repeat_ngram=3,
+                       max_line_aspect=14.0, oversize_ratio=2.5,
+                       tesseract_on_ink=True),
+    "legacy": Profile("legacy", beams=1, no_repeat_ngram=0,
+                      max_line_aspect=None, oversize_ratio=None,
+                      tesseract_on_ink=False),
+}
+
+
+def default_profile_name():
+    name = os.environ.get("ECHO_OCR_PROFILE", "default")
+    return name if name in PROFILES else "default"
+
+
+def profile(name=None):
+    """The named profile (default: ECHO_OCR_PROFILE, else "default")."""
+    return PROFILES[name or default_profile_name()]
+
+
+def generate_kwargs(prof, max_new_tokens=64):
+    """Arguments for TrOCR's ``model.generate`` under ``prof``."""
+    kwargs = {"max_new_tokens": max_new_tokens}
+    if prof.beams > 1:
+        kwargs.update(num_beams=prof.beams, early_stopping=True)
+    if prof.no_repeat_ngram:
+        kwargs["no_repeat_ngram_size"] = prof.no_repeat_ngram
+    return kwargs
 
 
 def binary():
@@ -51,32 +100,39 @@ def trocr_available():
 
 def _load_trocr():
     global _trocr
-    if _trocr is None:
-        import torch
-        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-
-        torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
-        with telemetry.io_call(log, "trocr.load", model=TROCR_MODEL):
-            processor = TrOCRProcessor.from_pretrained(TROCR_MODEL)
-            model = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL)
-        model.eval()
-        _trocr = (torch, processor, model)
+    with _trocr_lock:
+        if _trocr is None:
+            _trocr = _build_trocr()
     return _trocr
 
 
-def trocr_image_to_text(image_path, max_new_tokens=64):
+def _build_trocr():
+    import torch
+    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+
+    torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
+    with telemetry.io_call(log, "trocr.load", model=TROCR_MODEL):
+        processor = TrOCRProcessor.from_pretrained(TROCR_MODEL)
+        model = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL)
+    model.eval()
+    return torch, processor, model
+
+
+def trocr_image_to_text(image_path, prof=None):
     """Recognize a single text-line image with TrOCR."""
     from PIL import Image
 
     torch, processor, model = _load_trocr()
+    kwargs = generate_kwargs(prof or profile())
     with telemetry.io_call(log, "trocr", ok_level=logging.DEBUG,
-                           image=image_path) as call:
+                           image=image_path, beams=kwargs.get("num_beams", 1)
+                           ) as call:
         image = Image.open(image_path).convert("RGB")
         call["size"] = list(image.size)
         pixel_values = processor(images=image,
                                  return_tensors="pt").pixel_values
         with torch.no_grad():
-            ids = model.generate(pixel_values, max_new_tokens=max_new_tokens)
+            ids = model.generate(pixel_values, **kwargs)
         text = processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
         call["chars"] = len(text)
     return text

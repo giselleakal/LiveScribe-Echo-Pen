@@ -408,11 +408,13 @@ def stroke_bounds(stroke):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def group_lines(strokes):
+def group_lines(strokes, oversize_ratio=None):
     """Split strokes into text lines using their vertical position.
 
-    Small strokes (dots, accents) are assigned to the nearest line after
-    the main line bands are found from the taller strokes.
+    Line bands are found from letter-sized strokes; small strokes (dots,
+    accents) and, with ``oversize_ratio``, strokes taller than that many
+    median heights (circles, brackets, margin lines) are then assigned to
+    the nearest band instead of starting a line of their own.
     """
     if not strokes:
         return []
@@ -422,7 +424,8 @@ def group_lines(strokes):
         info.append((stroke, y0, y1, (y0 + y1) / 2.0, y1 - y0))
     heights = sorted(i[4] for i in info)
     median_h = heights[len(heights) // 2] or 1.0
-    tall = [i for i in info if i[4] >= 0.35 * median_h] or info
+    ceiling = oversize_ratio * median_h if oversize_ratio else float("inf")
+    tall = [i for i in info if 0.35 * median_h <= i[4] <= ceiling] or info
 
     clusters = []
     for item in sorted(tall, key=lambda i: i[3]):
@@ -444,6 +447,39 @@ def group_lines(strokes):
     for line in ordered:
         line.sort(key=lambda s: stroke_bounds(s)[0])
     return [ln for ln in ordered if ln]
+
+
+def split_wide_line(strokes, max_aspect):
+    """Split one line into chunks no wider than ``max_aspect`` × its height.
+
+    TrOCR squeezes every image into a 384×384 square, so a very long line
+    loses most of its horizontal detail. Cuts go at the widest gaps
+    between strokes (word spaces), never through a stroke; a line with no
+    gaps, or a short one, is returned whole.
+    """
+    if not max_aspect or len(strokes) < 2:
+        return [strokes]
+    bounds = [stroke_bounds(s) for s in strokes]
+    width = max(b[2] for b in bounds) - min(b[0] for b in bounds)
+    height = max(b[3] for b in bounds) - min(b[1] for b in bounds)
+    pieces = math.ceil(width / max(1.0, height) / max_aspect)
+    if pieces < 2:
+        return [strokes]
+    order = sorted(range(len(strokes)), key=lambda i: bounds[i][0])
+    gaps = []
+    right = bounds[order[0]][2]
+    for pos in range(1, len(order)):
+        gap = bounds[order[pos]][0] - right
+        if gap > 0:
+            gaps.append((gap, pos))
+        right = max(right, bounds[order[pos]][2])
+    cuts = sorted(pos for _, pos in sorted(gaps, reverse=True)[:pieces - 1])
+    chunks = []
+    start = 0
+    for cut in cuts + [len(order)]:
+        chunks.append([strokes[i] for i in order[start:cut]])
+        start = cut
+    return chunks
 
 
 def render_line_png(strokes, png_path, width=2400, max_height=1200,
@@ -595,9 +631,10 @@ class OcrJob:
     engine: str
     lang: str
     psm: int
+    profile: str = "default"
 
     def settings(self):
-        return [self.engine, self.lang, self.psm]
+        return [self.engine, self.lang, self.psm, self.profile]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -627,26 +664,35 @@ def ocr_page(strokes, page_dir, job):
     recognizer failed on every line, so a broken model is not mistaken
     for a blank page.
     """
+    prof = ocr.profile(job.profile)
     if job.engine != "trocr":
         ocr_png = os.path.join(page_dir, "ocr.png")
-        render_png(strokes, ocr_png, width=2000, grid=False)
+        bounds = ink_bounds(strokes) if prof.tesseract_on_ink else None
+        render_png(strokes, ocr_png, width=2000, grid=False, bounds=bounds)
         text = ocr.image_to_text(ocr_png, lang=job.lang, psm=job.psm)
         return OcrResult(clean_ocr_text(text), ["ocr.png"], True)
     texts, kept = [], []
-    lines = group_lines(strokes)
+    lines = group_lines(strokes, oversize_ratio=prof.oversize_ratio)
+    failures = 0
     for i, line in enumerate(lines):
-        name = "ocr-line-%d.png" % i
-        line_png = os.path.join(page_dir, name)
-        render_line_png(line, line_png)
-        kept.append(name)
-        try:
-            texts.append(ocr.trocr_image_to_text(line_png))
-        except Exception as e:
-            telemetry.warn(log, "ocr.line_failed",
-                           "TrOCR failed on line %d: %s" % (i, e),
-                           line=i, png=line_png, exc_type=type(e).__name__)
-    failures = len(lines) - len(texts)
-    if lines and failures == len(lines):
+        chunks = split_wide_line(line, prof.max_line_aspect)
+        words = []
+        for j, chunk in enumerate(chunks):
+            name = ("ocr-line-%d.png" % i if len(chunks) == 1
+                    else "ocr-line-%d-%d.png" % (i, j))
+            line_png = os.path.join(page_dir, name)
+            render_line_png(chunk, line_png)
+            kept.append(name)
+            try:
+                words.append(ocr.trocr_image_to_text(line_png, prof))
+            except Exception as e:
+                failures += 1
+                telemetry.warn(log, "ocr.line_failed",
+                               "TrOCR failed on line %d: %s" % (i, e),
+                               line=i, chunk=j, png=line_png,
+                               exc_type=type(e).__name__)
+        texts.append(" ".join(w for w in words if w))
+    if kept and failures == len(kept):
         raise RuntimeError("TrOCR failed on all %d lines" % failures)
     text = clean_ocr_text("\n".join(t for t in texts if t))
     return OcrResult(text, kept, failures == 0)
@@ -811,6 +857,11 @@ def main(argv=None):
                     help="Tesseract language(s), e.g. eng or eng+deu (default: eng)")
     ap.add_argument("--ocr-psm", type=int, default=6,
                     help="Tesseract page segmentation mode (default: 6)")
+    ap.add_argument("--ocr-profile", choices=sorted(ocr.PROFILES),
+                    default=ocr.default_profile_name(),
+                    help="segmentation/decoding profile; 'legacy' is the "
+                         "original behaviour (default: $ECHO_OCR_PROFILE "
+                         "or 'default')")
     ap.add_argument("--force", action="store_true",
                     help="re-render everything, ignoring the incremental state")
     ap.add_argument("--stt", action="store_true",
@@ -849,7 +900,8 @@ def main(argv=None):
 
     ocr_job = None
     if do_ocr and engine:
-        ocr_job = OcrJob(engine, args.ocr_lang, args.ocr_psm)
+        ocr_job = OcrJob(engine, args.ocr_lang, args.ocr_psm,
+                         args.ocr_profile)
 
     do_stt = args.stt
     if do_stt and not stt.available():
@@ -863,7 +915,8 @@ def main(argv=None):
     log.info("convert.start", extra={
         "root": ROOT, "force": args.force, "page": args.page,
         "session": args.session, "stt": do_stt,
-        "ocr_engine": ocr_job.engine if ocr_job else None})
+        "ocr_engine": ocr_job.engine if ocr_job else None,
+        "ocr_profile": ocr_job.profile if ocr_job else None})
     took_lock = acquire_lock()
     try:
         convert_library(args, ocr_job, do_stt)

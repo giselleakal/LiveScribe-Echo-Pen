@@ -116,7 +116,7 @@ class OcrBookkeepingTest(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def fake_recognize(self, png_path, **kwargs):
+    def fake_recognize(self, png_path, prof=None):
         self.calls += 1
         if self.interrupt_on and self.interrupt_on in png_path:
             raise KeyboardInterrupt
