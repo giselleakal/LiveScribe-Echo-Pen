@@ -12,7 +12,7 @@ Notepad shows the raw text underneath; edit there, read on GitHub.
 
 ## Training table
 
-| Original | Transcription (OCR output) | Correction (ground truth) |
+| Original | Transcription | Correction |
 |---|---|---|
 | ![sample 05](samples/sample_05.png) | hones are attached<br>a<br>too-to-to-to-to-to-to-to-to-to-to-<br>O After that I need to determine<br>D. D. D.<br>if these switches are COR-enabled. | phones are attached to.<br><br>(5) After that I need to determine if these switches are CER-enabled. |
 
