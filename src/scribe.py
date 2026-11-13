@@ -45,6 +45,9 @@ import urllib.request
 import uuid
 
 import paths
+import telemetry
+
+log = telemetry.get_logger("push")
 
 ROOT = paths.ROOT
 OUT = paths.OUT
@@ -339,6 +342,17 @@ def post_body(body, url, secret, request_id, ts=None):
             "X-Request-ID": request_id,
             "User-Agent": "echo-notebook/1.0",
         })
+    with telemetry.io_call(log, "hermes", url=url, request_id=request_id,
+                           bytes=len(body)) as call:
+        status, reply = _post(req)
+        call["status"] = status
+        call["outcome"] = classify(status)
+        if status != 200:
+            call["reply_tail"] = telemetry.tail(reply, 300)
+    return status, reply
+
+
+def _post(req):
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.status, resp.read()
@@ -569,6 +583,9 @@ def _push_locked(specs, force, secret):
         results[ident] = "queued for %s" % title
     save_state(state)
     sent, parked, msgs = flush_queue(url, secret)
+    log.info("push.done", extra={"targets": len(specs), "sent": sent,
+                                 "parked": len(parked),
+                                 "parked_classes": dict(msgs)})
     # flush_queue wrote its own accepted flags; reload to report accurately
     state = load_state()
     summary = {"sent": sent, "parked": parked, "messages": msgs}

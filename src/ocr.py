@@ -13,9 +13,14 @@ The Tesseract backend is a subprocess wrapper; the TrOCR backend imports
 ``torch``/``transformers`` lazily so the base pipeline still runs without
 them.
 """
+import logging
 import os
 import shutil
 import subprocess
+
+import telemetry
+
+log = telemetry.get_logger("ocr")
 
 DEFAULT_LANG = "eng"
 TROCR_MODEL = os.environ.get(
@@ -51,8 +56,9 @@ def _load_trocr():
         from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
         torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
-        processor = TrOCRProcessor.from_pretrained(TROCR_MODEL)
-        model = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL)
+        with telemetry.io_call(log, "trocr.load", model=TROCR_MODEL):
+            processor = TrOCRProcessor.from_pretrained(TROCR_MODEL)
+            model = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL)
         model.eval()
         _trocr = (torch, processor, model)
     return _trocr
@@ -63,11 +69,17 @@ def trocr_image_to_text(image_path, max_new_tokens=64):
     from PIL import Image
 
     torch, processor, model = _load_trocr()
-    image = Image.open(image_path).convert("RGB")
-    pixel_values = processor(images=image, return_tensors="pt").pixel_values
-    with torch.no_grad():
-        ids = model.generate(pixel_values, max_new_tokens=max_new_tokens)
-    return processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+    with telemetry.io_call(log, "trocr", ok_level=logging.DEBUG,
+                           image=image_path) as call:
+        image = Image.open(image_path).convert("RGB")
+        call["size"] = list(image.size)
+        pixel_values = processor(images=image,
+                                 return_tensors="pt").pixel_values
+        with torch.no_grad():
+            ids = model.generate(pixel_values, max_new_tokens=max_new_tokens)
+        text = processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+        call["chars"] = len(text)
+    return text
 
 
 def image_to_text(image_path, lang=DEFAULT_LANG, psm=6, timeout=120):
@@ -79,16 +91,20 @@ def image_to_text(image_path, lang=DEFAULT_LANG, psm=6, timeout=120):
     if not exe:
         raise RuntimeError("tesseract not found on PATH")
     cmd = [exe, image_path, "stdout", "-l", lang, "--psm", str(psm)]
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("tesseract timed out after %ss" % timeout)
-    if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError("tesseract failed (%d): %s" % (proc.returncode, err))
-    return proc.stdout.decode("utf-8", "replace").strip()
+    with telemetry.io_call(log, "tesseract", ok_level=logging.DEBUG,
+                           image=image_path, lang=lang, psm=psm) as call:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            call["outcome"] = "timeout"
+            raise RuntimeError("tesseract timed out after %ss" % timeout) \
+                from e
+        call["status"] = proc.returncode
+        if proc.returncode != 0:
+            call["outcome"] = "error"
+            call["stderr_tail"] = telemetry.tail(proc.stderr)
+            raise RuntimeError("tesseract failed (%d): %s"
+                               % (proc.returncode, telemetry.tail(proc.stderr)))
+        text = proc.stdout.decode("utf-8", "replace").strip()
+        call["chars"] = len(text)
+    return text

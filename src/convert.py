@@ -39,6 +39,9 @@ sys.path.insert(0, paths.VENDOR)
 import parsestf
 import ocr
 import stt
+import telemetry
+
+log = telemetry.get_logger("convert")
 
 PAGE_W, PAGE_H = 4963, 6278  # STF "dot" units; page size used by stf2pdf
 GRID = 83                     # visible dot-grid spacing in STF units
@@ -82,14 +85,22 @@ def acquire_lock(wait=3.0):
     if os.environ.get("ECHO_LOCK_HELD"):
         return False
     fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
-    deadline = time.monotonic() + wait
+    started = time.monotonic()
+    deadline = started + wait
+    waited = False
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             break
         except BlockingIOError:
+            if not waited:
+                waited = True
+                log.info("lock.wait", extra={"holder_pid": lock_owner()})
             if time.monotonic() >= deadline:
                 os.close(fd)
+                telemetry.warn(log, "lock.busy",
+                               "run lock still held after %.1fs" % wait,
+                               holder_pid=lock_owner(), wait_s=wait)
                 raise RuntimeError(
                     "Another convert is running (lock file: %s, pid %s). "
                     "Try again shortly." % (LOCK_PATH, lock_owner()))
@@ -214,8 +225,10 @@ def load_strokes(stf_path):
         try:
             sc.parse()
         except EOFError:
-            print("warning: %s is truncated; keeping %d complete strokes"
-                  % (stf_path, len(sc.strokes)), file=sys.stderr)
+            telemetry.warn(log, "stf.truncated",
+                           "%s is truncated; keeping %d complete strokes"
+                           % (stf_path, len(sc.strokes)),
+                           path=stf_path, strokes=len(sc.strokes))
     return [s for s in sc.strokes if s], sc.tmin, sc.tmax
 
 
@@ -629,8 +642,9 @@ def ocr_page(strokes, page_dir, job):
         try:
             texts.append(ocr.trocr_image_to_text(line_png))
         except Exception as e:
-            print("warning: TrOCR failed on line %d: %s" % (i, e),
-                  file=sys.stderr)
+            telemetry.warn(log, "ocr.line_failed",
+                           "TrOCR failed on line %d: %s" % (i, e),
+                           line=i, png=line_png, exc_type=type(e).__name__)
     failures = len(lines) - len(texts)
     if lines and failures == len(lines):
         raise RuntimeError("TrOCR failed on all %d lines" % failures)
@@ -682,8 +696,11 @@ def transcribe_page(entry, ink, job, last_good):
     try:
         result = ocr_page(ink.strokes, ink.page_dir, job)
     except Exception as e:
-        print("warning: OCR failed for %s: %s" % (ink.page_id, e),
-              file=sys.stderr)
+        telemetry.warn(log, "ocr.page_failed",
+                       "OCR failed for %s: %s" % (ink.page_id, e),
+                       page=ink.page_id, engine=job.engine,
+                       exc_type=type(e).__name__,
+                       kept_previous=has_transcription(last_good))
         if has_transcription(last_good):
             carry_ocr(entry, last_good)
             return
@@ -691,6 +708,10 @@ def transcribe_page(entry, ink, job, last_good):
         entry["ocr"] = False
         return
     prune_ocr_pngs(ink.page_dir, result.kept)
+    log.debug("ocr.page", extra={"page": ink.page_id, "engine": job.engine,
+                                 "lines": len(result.kept),
+                                 "complete": result.complete,
+                                 "chars": len(result.text)})
     entry.update({"ocr": result.complete, "ocr_engine": job.engine,
                   "ocr_settings": job.settings()})
     text_path = os.path.join(ink.page_dir, "text.txt")
@@ -808,16 +829,20 @@ def main(argv=None):
         if engine == "auto":
             engine = "trocr" if tr_ok else ("tesseract" if ts_ok else None)
         elif engine == "trocr" and not tr_ok:
-            print("warning: TrOCR is not available (use the project .venv); "
-                  "falling back to Tesseract", file=sys.stderr)
+            telemetry.warn(log, "ocr.engine_fallback",
+                           "TrOCR is not available (use the project .venv); "
+                           "falling back to Tesseract",
+                           wanted="trocr", tesseract=ts_ok)
             engine = "tesseract" if ts_ok else None
         elif engine == "tesseract" and not ts_ok:
-            print("warning: tesseract is not installed; falling back to TrOCR",
-                  file=sys.stderr)
+            telemetry.warn(log, "ocr.engine_fallback",
+                           "tesseract is not installed; falling back to TrOCR",
+                           wanted="tesseract", trocr=tr_ok)
             engine = "trocr" if tr_ok else None
         if engine is None:
-            print("warning: --ocr requested but no OCR engine is available; "
-                  "skipping OCR", file=sys.stderr)
+            telemetry.warn(log, "ocr.unavailable",
+                           "--ocr requested but no OCR engine is available; "
+                           "skipping OCR (run ./run doctor)")
             do_ocr = False
         else:
             print("OCR engine: %s" % engine)
@@ -828,14 +853,25 @@ def main(argv=None):
 
     do_stt = args.stt
     if do_stt and not stt.available():
-        print("warning: --stt requested but STT is not available (need the "
-              "project .venv with transformers + imageio-ffmpeg); skipping",
-              file=sys.stderr)
+        telemetry.warn(log, "stt.unavailable",
+                       "--stt requested but STT is not available (need the "
+                       "project .venv with transformers + imageio-ffmpeg); "
+                       "skipping (run ./run doctor)")
         do_stt = False
 
+    started = telemetry.monotonic()
+    log.info("convert.start", extra={
+        "root": ROOT, "force": args.force, "page": args.page,
+        "session": args.session, "stt": do_stt,
+        "ocr_engine": ocr_job.engine if ocr_job else None})
     took_lock = acquire_lock()
     try:
         convert_library(args, ocr_job, do_stt)
+    except BaseException as e:
+        log.error("convert.failed", exc_info=True, extra={
+            "duration_ms": round((telemetry.monotonic() - started) * 1000, 1),
+            "interrupted": isinstance(e, KeyboardInterrupt)})
+        raise
     finally:
         if took_lock:
             release_lock()
@@ -888,16 +924,40 @@ def open_library(args, ocr_job, do_stt):
     return lib
 
 
+class PhaseTimer:
+    """Wall time per pipeline phase, for the convert.done record."""
+
+    def __init__(self):
+        self.ms = {}
+        self._start = telemetry.monotonic()
+
+    def lap(self, phase):
+        now = telemetry.monotonic()
+        self.ms[phase] = round((now - self._start) * 1000, 1)
+        self._start = now
+
+
 def convert_library(args, ocr_job, do_stt):
     """Render, transcribe and index everything under data/ (lock held)."""
+    timer = PhaseTimer()
     lib = open_library(args, ocr_job, do_stt)
     pages, skipped_pages = convert_pages(lib)
+    timer.lap("pages")
     sessions, kept_audio, skipped_sessions = convert_sessions(lib)
     link_sessions(sessions, {p["id"] for p in pages})
-    prune_outputs(lib, {p["id"] for p in pages}, kept_audio)
+    timer.lap("sessions")
+    pruned = prune_outputs(lib, {p["id"] for p in pages}, kept_audio)
     if lib.do_stt:
         transcribe_sessions(lib, sessions)
+        timer.lap("stt")
     write_index(lib, pages, sessions)
+    timer.lap("index")
+    log.info("convert.done", extra={
+        "pages": len(pages), "pages_unchanged": skipped_pages,
+        "pages_ocr": sum(1 for p in pages if p.get("ocr")),
+        "sessions": len(sessions), "sessions_unchanged": skipped_sessions,
+        "pruned": pruned, "phase_ms": timer.ms,
+        "duration_ms": round(sum(timer.ms.values()), 1)})
     print("rendered %d pages (%d unchanged, %d sessions (%d unchanged))"
           % (len(pages), skipped_pages, len(sessions), skipped_sessions))
 
@@ -941,10 +1001,13 @@ def convert_page(lib, stf):
     try:
         entry, ink = render_page(lib, page_id, stf, prev)
     except Exception as e:
-        print("warning: page %s could not be converted (%s: %s); %s"
-              % (page_id, type(e).__name__, e,
-                 "keeping its last render" if prev else "skipping it"),
-              file=sys.stderr)
+        telemetry.warn(log, "page.failed",
+                       "page %s could not be converted (%s: %s); %s"
+                       % (page_id, type(e).__name__, e,
+                          "keeping its last render" if prev
+                          else "skipping it"),
+                       page=page_id, source=src_rel,
+                       exc_type=type(e).__name__, kept_previous=bool(prev))
         return (dict(prev), True) if prev else (None, False)
     last = prev or {}
     same_ink = lib.last_sources.get(src_rel) == sig
@@ -1097,8 +1160,9 @@ def copy_session_audio(lib, s):
                 os.remove(tmp)
             except OSError:
                 pass
-            print("audio copy failed for %s: %s" % (s["id"], e),
-                  file=sys.stderr)
+            telemetry.warn(log, "audio.copy_failed",
+                           "audio copy failed for %s: %s" % (s["id"], e),
+                           session=s["id"], part=i, source=src)
     return urls
 
 
@@ -1131,17 +1195,23 @@ def link_sessions(sessions, page_ids):
             elif raw.count(".") == 4 and short in page_ids:
                 linked.append(short)
             else:
-                print("warning: recording %s references page %s which is "
-                      "not present in the notebook" % (s["id"], raw),
-                      file=sys.stderr)
+                telemetry.warn(log, "session.missing_page",
+                               "recording %s references page %s which is "
+                               "not present in the notebook" % (s["id"], raw),
+                               session=s["id"], page=raw)
         s["pages"] = linked
 
 
 def prune_outputs(lib, page_ids, kept_audio):
-    """Remove output whose source is gone, so deletions from data/ stick."""
+    """Remove output whose source is gone, so deletions from data/ stick.
+
+    Returns how many page directories and audio files were removed.
+    """
+    pruned = 0
     for d in sorted(glob.glob(os.path.join(lib.pages_out, "*"))):
         if os.path.isdir(d) and os.path.basename(d) not in page_ids:
             shutil.rmtree(d, ignore_errors=True)
+            pruned += 1
             print("pruned output/pages/%s (no matching source)"
                   % os.path.basename(d))
     for f in sorted(glob.glob(os.path.join(lib.audio_out, "*.aac"))):
@@ -1149,10 +1219,12 @@ def prune_outputs(lib, page_ids, kept_audio):
             continue
         try:
             os.remove(f)
+            pruned += 1
             print("pruned output/audio/%s (no matching source)"
                   % os.path.basename(f))
         except OSError:
             pass
+    return pruned
 
 
 # ---------------------------------------------------------------------------
@@ -1202,7 +1274,9 @@ def transcribe_session(lib, s):
         text = stt.transcribe(stt.seq_to_floats(
             [os.path.join(lib.out_dir, u) for u in urls]))
     except Exception as e:
-        print("warning: STT failed for %s: %s" % (sid, e), file=sys.stderr)
+        telemetry.warn(log, "stt.session_failed",
+                       "STT failed for %s: %s" % (sid, e),
+                       session=sid, exc_type=type(e).__name__)
         return False
     s["transcript"] = text or ""
     tx_path = os.path.join(lib.audio_out, sid + ".txt")
@@ -1218,6 +1292,8 @@ def transcribe_session(lib, s):
     entry["stt_sig"] = sig
     entry["transcript"] = s["transcript"]
     save_state(lib.state)   # an interrupted STT run keeps finished sessions
+    log.info("stt.session", extra={"session": sid, "parts": len(urls),
+                                   "chars": len(s["transcript"])})
     return True
 
 

@@ -26,3 +26,6 @@ test-inbox/
 
 # convert/serve run lock
 .convert.lock
+
+# structured logs (./run logs)
+logs/

@@ -15,6 +15,9 @@ SANDBOX = tempfile.mkdtemp(prefix="echo-test-root-")
 os.environ["ECHO_ROOT"] = SANDBOX
 os.environ.pop("ECHO_SCRIBE_SECRET", None)
 os.environ.pop("ECHO_LOCK_HELD", None)
+# expected-failure tests would otherwise print warnings; tests read the
+# JSONL records instead
+os.environ["ECHO_CONSOLE_LOG_LEVEL"] = "CRITICAL"
 atexit.register(shutil.rmtree, SANDBOX, ignore_errors=True)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

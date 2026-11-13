@@ -43,6 +43,23 @@ else
     PYTHON="$(command -v python3)"
 fi
 
+# One correlation id for everything this invocation starts; every log
+# record in logs/echo.jsonl carries it (see ./run logs --run last).
+if [ -z "${ECHO_RUN_ID:-}" ]; then
+    ECHO_RUN_ID="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+fi
+export ECHO_RUN_ID
+
+# Record one structured event from bash; never fails the caller.
+#   log_event <event> [--level WARNING] [key=value ...]
+log_event() {
+    "$PYTHON" "$ROOT/src/telemetry.py" event run "$@" >/dev/null 2>&1 || true
+}
+
+now_ms() {
+    date +%s%3N
+}
+
 usage() {
     sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
 }
@@ -98,8 +115,9 @@ download_from_pen() {
     require_pen
     ensure_dumpscribe
     echo "Syncing pen (runs as root to access the USB device)..."
-    local logfile status
+    local logfile status started level
     logfile="$(mktemp)"
+    started="$(now_ms)"
     set +e
     # shellcheck disable=SC2024
     sudo "$ROOT/vendor/dumpscribe" "$ROOT/data" 2>&1 | tee "$logfile"
@@ -110,6 +128,14 @@ download_from_pen() {
     ECHO_PAGES_OK=0
     grep -q '\[ECHO\] audio download ok' "$logfile" && ECHO_AUDIO_OK=1
     grep -q '\[ECHO\] pages download ok' "$logfile" && ECHO_PAGES_OK=1
+    level=INFO
+    if [ "$status" -ne 0 ] || ! pen_fully_backed_up; then
+        level=WARNING
+    fi
+    log_event io --level "$level" target=dumpscribe mode=download \
+        status="$status" duration_ms="$(( $(now_ms) - started ))" \
+        audio_ok="$ECHO_AUDIO_OK" pages_ok="$ECHO_PAGES_OK" \
+        "output_tail=$(tail -c 400 "$logfile" | tr '\n' ' ')"
     rm -f "$logfile"
     if [ "$status" -ne 0 ]; then
         echo "ERROR: pen download failed (dumpscribe exit $status); nothing was deleted from the pen." >&2
@@ -135,11 +161,16 @@ confirm() {
 # Only ever called right after a download that saved everything.
 retire_pen() {
     echo "Retiring pen (no re-download; local backup already safe)..."
+    local started status
+    started="$(now_ms)"
     set +e
     sudo "$ROOT/vendor/dumpscribe" -r "$ROOT/data"
-    local status=$?
+    status=$?
     set -e
     own_data
+    log_event io --level "$([ "$status" -eq 0 ] && echo INFO || echo WARNING)" \
+        target=dumpscribe mode=retire status="$status" \
+        duration_ms="$(( $(now_ms) - started ))"
     if [ "$status" -ne 0 ]; then
         echo "ERROR: clearing the pen failed (dumpscribe exit $status)." >&2
         exit "$status"

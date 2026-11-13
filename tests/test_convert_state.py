@@ -210,9 +210,11 @@ class CorruptSourceTest(unittest.TestCase):
 
     def test_corrupt_page_does_not_stop_the_others(self):
         fixtures.write_page(tests.SANDBOX, PAGE_B, [], raw=b"garbage")
-        out = run_main()
+        run_main()
         self.assertIn(PAGE_A, index())
-        self.assertIn(PAGE_B, out)
+        failed = [r for r in convert.telemetry.read_records()
+                  if r.get("event") == "page.failed"]
+        self.assertEqual([r["page"] for r in failed], [PAGE_B])
 
     def test_corrupted_page_keeps_its_last_good_render(self):
         fixtures.write_page(tests.SANDBOX, PAGE_B,

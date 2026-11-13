@@ -14,9 +14,13 @@ resampled to 16 kHz by ffmpeg). Long recordings are chunked into ~30 s
 windows with 1 s overlap, matching how the model was trained; chunk texts
 are stitched on word boundaries (no timestamps in v1).
 """
+import logging
 import os
 import subprocess
-import sys
+
+import telemetry
+
+log = telemetry.get_logger("stt")
 
 MOONSHINE_MODEL = os.environ.get(
     "MOONSHINE_MODEL", "UsefulSensors/moonshine-base")
@@ -61,8 +65,10 @@ def _load_model():
         from transformers import AutoProcessor, MoonshineForConditionalGeneration
 
         torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
-        processor = AutoProcessor.from_pretrained(MOONSHINE_MODEL)
-        model = MoonshineForConditionalGeneration.from_pretrained(MOONSHINE_MODEL)
+        with telemetry.io_call(log, "moonshine.load", model=MOONSHINE_MODEL):
+            processor = AutoProcessor.from_pretrained(MOONSHINE_MODEL)
+            model = MoonshineForConditionalGeneration.from_pretrained(
+                MOONSHINE_MODEL)
         model.eval()
         _model = (torch, processor, model)
     return _model
@@ -112,6 +118,15 @@ def transcribe(audio):
         return ""
     torch, processor, model = _load_model()
     texts = []
+    with telemetry.io_call(log, "moonshine",
+                           audio_s=round(len(audio) / SAMPLE_RATE, 1)) as call:
+        texts = _transcribe_chunks(torch, processor, model, audio)
+        call["chunks"] = len(texts)
+    return _stitch(texts)
+
+
+def _transcribe_chunks(torch, processor, model, audio):
+    texts = []
     for chunk in _chunks(audio):
         feats = processor(audio=chunk, sampling_rate=SAMPLE_RATE,
                           return_tensors="pt")
@@ -124,7 +139,7 @@ def transcribe(audio):
         text = processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
         if text:
             texts.append(text)
-    return _stitch(texts)
+    return texts
 
 
 def seq_to_floats(paths):
@@ -140,7 +155,8 @@ def seq_to_floats(paths):
         try:
             chunks.append(_decode_floats(p))
         except Exception as e:
-            print("warning: could not decode %s: %s" % (p, e), file=sys.stderr)
+            telemetry.warn(log, "audio.decode_failed",
+                           "could not decode %s: %s" % (p, e), path=p)
     if not chunks:
         return np.zeros(0, dtype=np.float32)
     return np.concatenate(chunks)
@@ -151,14 +167,19 @@ def _decode_floats(path, samplerate=SAMPLE_RATE):
     ff = ffmpeg_exe()
     if not ff:
         raise RuntimeError("ffmpeg unavailable; install imageio-ffmpeg")
-    proc = subprocess.run(
-        [ff, "-nostdin", "-hide_banner", "-loglevel", "error",
-         "-i", path, "-f", "f32le", "-ac", "1", "-ar", str(samplerate),
-         "pipe:1"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError("ffmpeg failed (%d): %s"
-                           % (proc.returncode,
-                              proc.stderr.decode("utf-8", "replace").strip()))
+    with telemetry.io_call(log, "ffmpeg", ok_level=logging.DEBUG,
+                           path=path) as call:
+        proc = subprocess.run(
+            [ff, "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-i", path, "-f", "f32le", "-ac", "1", "-ar", str(samplerate),
+             "pipe:1"],
+            capture_output=True, check=False)
+        call["status"] = proc.returncode
+        call["bytes"] = len(proc.stdout)
+        if proc.returncode != 0:
+            call["outcome"] = "error"
+            call["stderr_tail"] = telemetry.tail(proc.stderr)
+            raise RuntimeError("ffmpeg failed (%d): %s"
+                               % (proc.returncode, telemetry.tail(proc.stderr)))
     import numpy as np
     return np.frombuffer(proc.stdout, dtype=np.float32)

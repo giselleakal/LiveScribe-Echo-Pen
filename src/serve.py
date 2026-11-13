@@ -13,12 +13,14 @@ import glob
 import html
 import json
 import http.server
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
 import urllib.parse
+import uuid
 
 # Core pipeline helpers (state load/save, the run lock). This imports only
 # stdlib + the vendored parsestf/ocr at module load; cairo and torch stay
@@ -26,6 +28,9 @@ import urllib.parse
 import convert
 import paths
 import scribe
+import telemetry
+
+log = telemetry.get_logger("serve")
 
 ROOT = paths.ROOT
 OUT = paths.OUT
@@ -694,12 +699,23 @@ def _reconcile():
     the run lock). Output is regenerated atomically, so a concurrent GET
     never sees a torn file. Returns True when convert succeeded.
     """
-    env = dict(os.environ)
+    return run_convert([])
+
+
+def run_convert(argv):
+    """Run convert.py as a child that inherits the lock and correlation ids.
+
+    The caller holds the run lock (ECHO_LOCK_HELD tells the child to skip
+    it). Returns True when convert exited 0.
+    """
+    env = telemetry.child_env()
     env["ECHO_LOCK_HELD"] = "1"
-    proc = subprocess.run([sys.executable, CONVERT_PY], env=env, check=False)
-    if proc.returncode != 0:
-        print("warning: reconcile convert exited %d" % proc.returncode,
-              file=sys.stderr)
+    with telemetry.io_call(log, "convert", argv=argv) as call:
+        proc = subprocess.run([sys.executable, CONVERT_PY] + argv,
+                              env=env, check=False)
+        call["status"] = proc.returncode
+        if proc.returncode != 0:
+            call["outcome"] = "error"
     return proc.returncode == 0
 
 
@@ -770,11 +786,7 @@ def run_lock():
 def _run_convert_locked(argv):
     """Run ``convert.py`` with ``argv`` under the run lock; True on success."""
     with run_lock():
-        env = dict(os.environ)
-        env["ECHO_LOCK_HELD"] = "1"
-        proc = subprocess.run([sys.executable, CONVERT_PY] + argv,
-                              env=env, check=False)
-        return proc.returncode == 0
+        return run_convert(argv)
 
 
 def send_json(handler, status, payload):
@@ -826,6 +838,36 @@ def host_name(host_header):
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=OUT, **kwargs)
+
+    # -- request records ----------------------------------------------------
+
+    def send_response(self, code, message=None):
+        self._status = code
+        super().send_response(code, message)
+
+    def handle_one_request(self):
+        """Handle one request with its own request_id and one http record.
+
+        POSTs log at INFO; GETs (page loads, thumbnails, audio) at DEBUG so
+        browsing does not flood the log. Errors are always WARNING.
+        """
+        self._status = None
+        started = telemetry.monotonic()
+        with telemetry.bound_request(uuid.uuid4().hex[:12]):
+            super().handle_one_request()
+            if not getattr(self, "command", None):
+                return   # connection closed without a request
+            status = self._status or 0
+            level = logging.INFO if self.command == "POST" else logging.DEBUG
+            if status >= 500:
+                level = logging.WARNING
+            log.log(level, "http.request", extra={
+                "method": self.command,
+                "path": urllib.parse.urlsplit(self.path).path,
+                "status": status,
+                "client": self.client_address[0],
+                "duration_ms": round(
+                    (telemetry.monotonic() - started) * 1000, 1)})
 
     # -- request guards ----------------------------------------------------
 
@@ -916,6 +958,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             status, payload = handler(self._read_json(), *arg)
         except ApiError as e:
             status, payload = e.status, {"ok": False, "error": e.message}
+            log.log(logging.WARNING if e.status >= 500 else logging.INFO,
+                    "api.refused", extra={"path": self.path,
+                                          "status": e.status,
+                                          "reason": e.message})
         send_json(self, status, payload)
 
     def _route(self):
@@ -1085,6 +1131,10 @@ def main():
 
     with http.server.ThreadingHTTPServer((args.host, args.port), Handler) as httpd:
         host, port = httpd.server_address[:2]
+        log.info("serve.start", extra={"host": host, "port": port,
+                                       "out": OUT,
+                                       "lan_changes": bool(os.environ.get(
+                                           "ECHO_ALLOW_LAN_DELETES"))})
         print("Serving notebook at http://%s:%d/  (output dir: %s)"
               % (host, port, OUT))
         httpd.serve_forever()
