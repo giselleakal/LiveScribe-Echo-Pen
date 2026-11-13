@@ -161,13 +161,20 @@ project `.venv` provides it, then falls back to `tesseract`. Override with
 **Profiles.** `--ocr-profile` (or `ECHO_OCR_PROFILE`) chooses how lines are
 segmented and decoded:
 
-- `default` decodes TrOCR with beam search and blocks repeated phrases,
-  which stops the `to-to-to…` loops. It also splits very long lines and
-  keeps circles and brackets from starting lines of their own.
 - `legacy` is the original behaviour.
+- `beam` adds beam search that blocks the `to-to-to…` repetition loops,
+  splits very long lines at word gaps, and stops circles and margin
+  lines from making lines of their own.
+- `default` adds four changes on top of `beam`:
+  - draws each line the way TrOCR's training lines look
+  - finds line breaks from the order the pen wrote
+  - reads each line three ways and keeps the most confident reading
+  - prefers real words among near-tied readings (system word list plus
+    the private `training/private/vocabulary.txt`)
 
-The profile is part of each page's OCR record, so after changing it,
-`./run ocr` re-transcribes once.
+The profile's settings are part of each page's OCR record, so after
+changing it, `./run ocr` re-transcribes once. The table in
+[`training/README.md`](training/README.md) lists every setting.
 
 **Measuring accuracy.** `./run ocr-eval` scores the OCR against pages whose
 text you know: character and word error rates per sample. Compare

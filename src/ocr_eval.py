@@ -13,18 +13,26 @@ grouping, line rendering, recognition); ``image`` samples are single text
 lines sent straight to the recognizer. Rendered line images go to a
 temporary directory, never to output/.
 
+Each sample may carry ``"split": "dev"`` (the default) or ``"test"``.
+Try ideas on dev; look at test only to confirm a decision, so the
+settings are not fitted to the samples used to judge them.
+
 Scores are computed on normalized text (lower case, whitespace collapsed),
 so they measure reading rather than formatting. Lower is better; 0.0 is
-perfect. Compare profiles on the same manifest before changing a default:
+perfect. The 95% interval comes from resampling the samples: a change
+whose gain is smaller than that interval is not shown to be real.
 
     ./run ocr-eval --profile legacy
     ./run ocr-eval --profile default
+    ./run ocr-eval --profile beam --set render=normalized   # one change
+    ./run ocr-eval --split test                             # confirm once
 """
 import argparse
 import dataclasses
 import glob
 import json
 import os
+import random
 import sys
 import tempfile
 
@@ -39,6 +47,8 @@ SUMMARY = "Score OCR against ground truth: character and word error rates."
 
 DEFAULT_MANIFEST = os.path.join(paths.REPO, "training", "private",
                                 "eval.json")
+SPLITS = ("dev", "test")
+BOOTSTRAP_ROUNDS = 1000
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,7 +106,17 @@ def load_manifest(path):
                 ("page" in sample) == ("image" in sample):
             raise ValueError(f'{path}: sample {i} needs "truth" and exactly '
                              'one of "page" or "image"')
+        if sample.get("split", "dev") not in SPLITS:
+            raise ValueError(f'{path}: sample {i} "split" must be "dev" or '
+                             '"test"')
     return samples
+
+
+def in_split(samples, split):
+    """The samples of one split ("all" keeps every sample)."""
+    if split == "all":
+        return list(samples)
+    return [s for s in samples if s.get("split", "dev") == split]
 
 
 def page_strokes(page_id, data_dir=paths.DATA):
@@ -119,7 +139,7 @@ def recognize_sample(sample, job, base_dir, work_dir):
         return convert.ocr_page(strokes, page_dir, job).text
     image = os.path.join(base_dir, sample["image"])
     if job.engine == "trocr":
-        return ocr.trocr_image_to_text(image, ocr.profile(job.profile))
+        return ocr.recognize([image], job.profile)
     return ocr.image_to_text(image, lang=job.lang, psm=7)
 
 
@@ -150,17 +170,43 @@ def mean(values):
     return round(sum(values) / len(values), 4) if values else 0.0
 
 
-def report(scores, job):
-    print(f"engine={job.engine} profile={job.profile} samples={len(scores)}")
+def interval(values, rounds=BOOTSTRAP_ROUNDS, seed=0):
+    """95% bootstrap interval of the mean of ``values`` (seeded, so the
+    same scores always give the same interval)."""
+    values = list(values)
+    if len(values) < 2:
+        return mean(values), mean(values)
+    rng = random.Random(seed)
+    means = sorted(sum(rng.choices(values, k=len(values))) / len(values)
+                   for _ in range(rounds))
+    return (round(means[int(0.025 * rounds)], 4),
+            round(means[int(0.975 * rounds) - 1], 4))
+
+
+def summary(scores, job, split):
+    """Mean scores and their intervals, as one dict."""
+    cer = [s.cer for s in scores]
+    wer = [s.wer for s in scores]
+    return {"engine": job.engine, "profile": job.profile.name,
+            "split": split, "samples": len(scores),
+            "cer": mean(cer), "cer_95": interval(cer),
+            "wer": mean(wer), "wer_95": interval(wer),
+            "errors": sum(1 for s in scores if s.error)}
+
+
+def report(scores, job, split):
+    print(f"engine={job.engine} profile={job.profile.name} split={split} "
+          f"samples={len(scores)}")
     print(f"{'sample':<24} {'CER':>7} {'WER':>7} {'lines':>6} {'seconds':>7}")
     for s in scores:
         lines = f"{s.found_lines}/{s.truth_lines}"
         error = f"  ERROR {s.error}" if s.error else ""
         print(f"{s.sample[:24]:<24} {s.cer:7.3f} {s.wer:7.3f} {lines:>6} "
               f"{s.seconds:7.2f}{error}")
-    cer = mean(s.cer for s in scores)
-    wer = mean(s.wer for s in scores)
-    print(f"{'mean':<24} {cer:7.3f} {wer:7.3f}")
+    total = summary(scores, job, split)
+    print(f"{'mean':<24} {total['cer']:7.3f} {total['wer']:7.3f}")
+    print(f"95% interval: CER {total['cer_95'][0]:.3f}-{total['cer_95'][1]:.3f}"
+          f", WER {total['wer_95'][0]:.3f}-{total['wer_95'][1]:.3f}")
 
 
 def choose_engine(requested):
@@ -176,7 +222,7 @@ def choose_engine(requested):
     return None
 
 
-def main(argv=None):
+def parse_args(argv):
     ap = argparse.ArgumentParser(description=SUMMARY)
     ap.add_argument("--manifest", default=DEFAULT_MANIFEST,
                     help="samples file (default: "
@@ -185,42 +231,57 @@ def main(argv=None):
                     default="auto")
     ap.add_argument("--profile", choices=sorted(ocr.PROFILES),
                     default=ocr.default_profile_name())
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="change one profile setting, e.g. render=plain "
+                         "(repeatable)")
+    ap.add_argument("--split", choices=SPLITS + ("all",), default="dev",
+                    help="which samples to score (default: dev)")
     ap.add_argument("--lang", default=ocr.DEFAULT_LANG)
     ap.add_argument("--json", action="store_true",
                     help="print machine-readable results")
-    args = ap.parse_args(argv)
+    return ap.parse_args(argv)
+
+
+def load_samples(args):
+    """The selected samples, or None with the reason printed."""
     try:
-        samples = load_manifest(args.manifest)
+        samples = in_split(load_manifest(args.manifest), args.split)
     except FileNotFoundError:
         print(f"no manifest at {args.manifest}; see training/README.md to "
               "create one", file=sys.stderr)
-        return 2
+        return None
     except (OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
-        return 2
+        return None
     if not samples:
-        print(f"no samples in {args.manifest}; see training/README.md to "
-              "add some", file=sys.stderr)
-        return 2
-    engine = choose_engine(args.engine)
+        print(f"no {args.split} samples in {args.manifest}; see "
+              "training/README.md to add some", file=sys.stderr)
+        return None
+    return samples
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    samples = load_samples(args)
+    engine = choose_engine(args.engine) if samples else None
     if engine is None:
         return 2
-    job = convert.OcrJob(engine, args.lang, 6, args.profile)
-    scores = evaluate(samples, job, os.path.dirname(
-        os.path.abspath(args.manifest)))
-    log.info("ocr_eval.done", extra={
-        "engine": engine, "profile": args.profile, "samples": len(scores),
-        "cer": mean(s.cer for s in scores), "wer": mean(s.wer for s in scores),
-        "errors": sum(1 for s in scores if s.error)})
+    try:
+        prof = ocr.override(ocr.profile(args.profile), args.set)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    job = convert.OcrJob(engine, args.lang, 6, prof)
+    scores = evaluate(samples, job,
+                      os.path.dirname(os.path.abspath(args.manifest)))
+    total = summary(scores, job, args.split)
+    log.info("ocr_eval.done", extra=total)
     if args.json:
-        print(json.dumps({"engine": engine, "profile": args.profile,
-                          "cer": mean(s.cer for s in scores),
-                          "wer": mean(s.wer for s in scores),
-                          "samples": [dataclasses.asdict(s) for s in scores]},
-                         indent=2))
+        print(json.dumps(dict(total, samples=[dataclasses.asdict(s)
+                                              for s in scores]), indent=2))
     else:
-        report(scores, job)
-    return 1 if any(s.error for s in scores) else 0
+        report(scores, job, args.split)
+    return 1 if total["errors"] else 0
 
 
 if __name__ == "__main__":

@@ -36,3 +36,12 @@ Nothing else needs migrating:
 - `.push-state.json`, `titles.json` and `notebook_names.json` are
   unchanged.
 - `logs/` is created on first use.
+
+## OCR accuracy (#5)
+
+| Step | Why |
+|---|---|
+| `./run setup --ocr` (or `sudo apt install wamerican`) | the word prior needs a system word list; `./run doctor` shows `vocabulary` |
+| Expect the first `./run ocr` to re-transcribe every page once | the `default` profile changed, and a profile's settings are each page's reuse key |
+| Optional: `training/private/vocabulary.txt`, one word per line | names and acronyms the word prior should know |
+| Before trusting `default`: mark some samples `"split": "test"` and compare `./run ocr-eval --profile beam` with `./run ocr-eval` | it was not measured on real handwriting; `ECHO_OCR_PROFILE=beam` keeps the previous behaviour |

@@ -364,10 +364,10 @@ def render_svg(strokes, path, bounds=None):
     atomic_write(path, "".join(parts))
 
 
-def render_png(strokes, png_path, width=320, grid=True, bounds=None):
+def new_canvas(bounds, width):
+    """A white cairo surface ``width`` px wide showing ``bounds`` (STF
+    units); returns (surface, context) with the context in STF units."""
     import cairo
-    if bounds is None:
-        bounds = (0, 0, PAGE_W, PAGE_H)
     minx, miny, maxx, maxy = bounds
     bw = max(1.0, maxx - minx)
     bh = max(1.0, maxy - miny)
@@ -379,23 +379,37 @@ def render_png(strokes, png_path, width=320, grid=True, bounds=None):
     ctx.paint()
     ctx.scale(scale, scale)
     ctx.translate(-minx, -miny)
-    if grid:
-        # dot grid
-        ctx.set_source_rgb(0.79, 0.83, 0.91)
-        for gx, gy, r in dot_grid(bounds):
-            ctx.arc(gx, gy, r, 0, math.tau)
-            ctx.fill()
-    # ink
-    ctx.set_source_rgb(*[c / 255.0 for c in INK])
+    return surface, ctx
+
+
+def draw_strokes(ctx, strokes, width_of):
+    """Stroke every pen path; ``width_of(stroke)`` gives its line width."""
+    import cairo
     ctx.set_line_cap(cairo.LINE_CAP_ROUND)
     ctx.set_line_join(cairo.LINE_JOIN_ROUND)
     for stroke in strokes:
-        avg_f = sum(p[2] for p in stroke) / len(stroke)
-        ctx.set_line_width(stroke_width(avg_f))
+        ctx.set_line_width(width_of(stroke))
         ctx.move_to(stroke[0][0], stroke[0][1])
         for x, y, _ in stroke[1:]:
             ctx.line_to(x, y)
         ctx.stroke()
+
+
+def force_width(stroke):
+    return stroke_width(sum(p[2] for p in stroke) / len(stroke))
+
+
+def render_png(strokes, png_path, width=320, grid=True, bounds=None):
+    if bounds is None:
+        bounds = (0, 0, PAGE_W, PAGE_H)
+    surface, ctx = new_canvas(bounds, width)
+    if grid:
+        ctx.set_source_rgb(0.79, 0.83, 0.91)
+        for gx, gy, r in dot_grid(bounds):
+            ctx.arc(gx, gy, r, 0, math.tau)
+            ctx.fill()
+    ctx.set_source_rgb(*[c / 255.0 for c in INK])
+    draw_strokes(ctx, strokes, force_width)
     publish_png(surface, png_path)
 
 
@@ -459,6 +473,83 @@ def group_lines(strokes, oversize_ratio=None):
     for line in ordered:
         line.sort(key=lambda s: stroke_bounds(s)[0])
     return [ln for ln in ordered if ln]
+
+
+LINE_TOLERANCE = 0.75   # same line: centres within this many letter heights
+
+
+def centre(stroke):
+    x0, y0, x1, y1 = stroke_bounds(stroke)
+    return (x0 + x1) / 2.0, (y0 + y1) / 2.0
+
+
+def group_lines_temporal(strokes, oversize_ratio=None):
+    """Split strokes into text lines using the order they were written.
+
+    The pen moves along a line and then jumps to the next one, so a jump
+    in height between consecutive letters is a line break even when the
+    lines slope or curve. A later run of writing that continues an
+    earlier line (a word added afterwards) joins that line. Dots, accents
+    and oversize strokes go with the letter written just before them.
+    """
+    if not strokes:
+        return []
+    median_h = median_height(strokes)
+    ceiling = oversize_ceiling(strokes, oversize_ratio)
+    tolerance = LINE_TOLERANCE * median_h
+    lines, line_of, current = [], {}, None
+    for i, stroke in enumerate(strokes):
+        if not 0.35 * median_h <= stroke_height(stroke) <= ceiling:
+            continue
+        if current is None or not _continues(lines[current], stroke,
+                                             tolerance):
+            current = _line_for(lines, stroke, tolerance)
+        lines[current].append(stroke)
+        line_of[i] = current
+    if not lines:
+        return group_lines(strokes, oversize_ratio)
+    _attach_marks(strokes, lines, line_of)
+    lines.sort(key=lambda ln: sum(centre(s)[1] for s in ln) / len(ln))
+    for line in lines:
+        line.sort(key=lambda s: stroke_bounds(s)[0])
+    return lines
+
+
+def _continues(line, stroke, tolerance):
+    """True when ``stroke`` is at the height of the line's last letters."""
+    recent = line[-3:]
+    height = sum(centre(s)[1] for s in recent) / len(recent)
+    return abs(centre(stroke)[1] - height) <= tolerance
+
+
+def _line_for(lines, stroke, tolerance):
+    """Index of the existing line ``stroke`` continues, else a new line.
+
+    It continues a line when it sits at the height of that line's
+    nearest letter horizontally (lines may slope).
+    """
+    x, y = centre(stroke)
+    for index, line in enumerate(lines):
+        nearest = min(line, key=lambda s: abs(centre(s)[0] - x))
+        if abs(centre(nearest)[1] - y) <= tolerance:
+            return index
+    lines.append([])
+    return len(lines) - 1
+
+
+def _attach_marks(strokes, lines, line_of):
+    """Put each small or oversize stroke on the line of the letter written
+    closest before it (or the first letter, if it came first)."""
+    first = min(line_of)
+    previous = line_of[first]
+    for i, stroke in enumerate(strokes):
+        if i in line_of:
+            previous = line_of[i]
+            continue
+        lines[previous].append(stroke)
+
+
+GROUPERS = {"vertical": group_lines, "temporal": group_lines_temporal}
 
 
 def oversize_ceiling(strokes, ratio):
@@ -531,6 +622,39 @@ def render_line_png(strokes, png_path, width=2400, max_height=1200,
     if bh > 0 and width * (bh / bw) > max_height:
         width = max(100, int(max_height * (bw / bh)))
     render_png(strokes, png_path, width=width, grid=False, bounds=bounds)
+
+
+LETTER_PX = 40        # rendered height of a typical letter
+PAD_LETTERS = 0.6     # margin around a line, in letter heights
+MAX_LINE_PX = 4000    # widest line image
+
+
+def render_line_normalized(strokes, png_path, frame, pen_width):
+    """Render one line the way TrOCR's training lines look: black ink on
+    white, letters a fixed height, the pen a fixed fraction of a letter
+    whatever the pen pressure, and the same margin on every line.
+
+    ``frame`` (the letter-sized strokes) sets the crop and the letter
+    height; ``pen_width`` is a fraction of the letter height. A line
+    wider than MAX_LINE_PX is scaled down to fit, which only happens
+    when line splitting is off.
+    """
+    letter = median_height(frame)
+    pad = PAD_LETTERS * letter
+    x0, y0, x1, y1 = _frame_bounds(frame)
+    bounds = (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+    width = round((bounds[2] - bounds[0]) * LETTER_PX / letter)
+    surface, ctx = new_canvas(bounds, max(16, min(MAX_LINE_PX, width)))
+    ctx.set_source_rgb(0, 0, 0)
+    draw_strokes(ctx, strokes, lambda _: pen_width * letter)
+    publish_png(surface, png_path)
+
+
+def _frame_bounds(strokes):
+    """(minx, miny, maxx, maxy) of all ``strokes``."""
+    boxes = [stroke_bounds(s) for s in strokes]
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
 def clean_ocr_text(text):
@@ -668,10 +792,11 @@ class OcrJob:
     engine: str
     lang: str
     psm: int
-    profile: str = "default"
+    profile: "ocr.Profile"
 
     def settings(self):
-        return [self.engine, self.lang, self.psm, self.profile]
+        return [self.engine, self.lang, self.psm,
+                ocr.profile_key(self.profile)]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -701,7 +826,7 @@ def ocr_page(strokes, page_dir, job):
     recognizer failed on every line, so a broken model is not mistaken
     for a blank page.
     """
-    prof = ocr.profile(job.profile)
+    prof = job.profile
     if job.engine != "trocr":
         ocr_png = os.path.join(page_dir, "ocr.png")
         bounds = ink_bounds(strokes) if prof.tesseract_on_ink else None
@@ -709,14 +834,15 @@ def ocr_page(strokes, page_dir, job):
         text = ocr.image_to_text(ocr_png, lang=job.lang, psm=job.psm)
         return OcrResult(clean_ocr_text(text), ["ocr.png"], True)
     ceiling = oversize_ceiling(strokes, prof.oversize_ratio)
-    texts, kept, failures = [], [], 0
-    for i, line in enumerate(group_lines(strokes, prof.oversize_ratio)):
-        text, names, failed = read_line(LineJob(i, line, page_dir, prof,
-                                                ceiling))
-        texts.append(text)
-        kept += names
-        failures += failed
-    if kept and failures == len(kept):
+    lines = GROUPERS[prof.lines](strokes, prof.oversize_ratio)
+    texts, kept, chunks, failures = [], [], 0, 0
+    for i, line in enumerate(lines):
+        result = read_line(LineJob(i, line, page_dir, prof, ceiling))
+        texts.append(result.text)
+        kept += result.images
+        chunks += result.chunks
+        failures += result.failed
+    if chunks and failures == chunks:
         raise RuntimeError("TrOCR failed on all %d lines" % failures)
     text = clean_ocr_text("\n".join(t for t in texts if t))
     return OcrResult(text, kept, failures == 0)
@@ -731,29 +857,56 @@ class LineJob:
     ceiling: float
 
 
-def read_line(job):
-    """TrOCR one text line, in chunks if it is very wide.
+@dataclasses.dataclass(frozen=True)
+class LineResult:
+    text: str
+    images: list    # ocr*.png names written for this line
+    chunks: int     # pieces the line was read in
+    failed: int     # pieces the recognizer failed on
 
-    Returns (text, image names, chunks that failed).
-    """
+
+def read_line(job):
+    """TrOCR one text line, in chunks if it is very wide."""
     chunks = split_wide_line(job.strokes, job.prof.max_line_aspect,
                              job.ceiling)
-    words, names, failed = [], [], 0
+    words, images, failed = [], [], 0
     for j, chunk in enumerate(chunks):
-        name = ("ocr-line-%d.png" % job.index if len(chunks) == 1
-                else "ocr-line-%d-%d.png" % (job.index, j))
-        png = os.path.join(job.page_dir, name)
-        render_line_png(chunk, png, frame=line_frame(chunk, job.ceiling))
-        names.append(name)
+        stem = ("ocr-line-%d" % job.index if len(chunks) == 1
+                else "ocr-line-%d-%d" % (job.index, j))
+        names = render_readings(chunk, stem, job)
+        images += names
         try:
-            words.append(ocr.trocr_image_to_text(png, job.prof))
+            words.append(ocr.recognize(
+                [os.path.join(job.page_dir, n) for n in names], job.prof))
         except Exception as e:
             failed += 1
             telemetry.warn(log, "ocr.line_failed",
                            "TrOCR failed on line %d: %s" % (job.index, e),
-                           line=job.index, chunk=j, png=png,
+                           line=job.index, chunk=j,
                            exc_type=type(e).__name__)
-    return " ".join(w for w in words if w), names, failed
+    return LineResult(" ".join(w for w in words if w), images, len(chunks),
+                      failed)
+
+
+def render_readings(chunk, stem, job):
+    """Render the images a chunk is read from; returns their file names.
+
+    The plain renderer draws one image as the pen wrote it. The
+    normalized one draws one image per pen width in the profile, so the
+    recognizer can keep the reading it is most sure of.
+    """
+    frame = line_frame(chunk, job.ceiling)
+    if job.prof.render != "normalized":
+        name = stem + ".png"
+        render_line_png(chunk, os.path.join(job.page_dir, name), frame=frame)
+        return [name]
+    widths = job.prof.pen_widths
+    names = [stem + ".png" if len(widths) == 1 else "%s-v%d.png" % (stem, k)
+             for k in range(len(widths))]
+    for name, width in zip(names, widths):
+        render_line_normalized(chunk, os.path.join(job.page_dir, name), frame,
+                               width)
+    return names
 
 
 def has_transcription(entry):
@@ -935,9 +1088,12 @@ def main(argv=None):
                     help="Tesseract page segmentation mode (default: 6)")
     ap.add_argument("--ocr-profile", choices=sorted(ocr.PROFILES),
                     default=ocr.default_profile_name(),
-                    help="segmentation/decoding profile; 'legacy' is the "
-                         "original behaviour (default: $ECHO_OCR_PROFILE "
-                         "or 'default')")
+                    help="segmentation/decoding profile: 'legacy' is the "
+                         "original OCR, 'beam' adds beam search and line "
+                         "splitting, 'default' adds normalized rendering, "
+                         "pen-order lines, several readings and a "
+                         "vocabulary prior (default: $ECHO_OCR_PROFILE or "
+                         "'default')")
     ap.add_argument("--force", action="store_true",
                     help="re-render everything, ignoring the incremental state")
     ap.add_argument("--stt", action="store_true",
@@ -953,7 +1109,7 @@ def main(argv=None):
     if engine:
         print("OCR engine: %s" % engine)
         ocr_job = OcrJob(engine, args.ocr_lang, args.ocr_psm,
-                         args.ocr_profile)
+                         ocr.profile(args.ocr_profile))
 
     do_stt = args.stt
     if do_stt and not stt.available():
@@ -968,7 +1124,7 @@ def main(argv=None):
         "root": ROOT, "force": args.force, "page": args.page,
         "session": args.session, "stt": do_stt,
         "ocr_engine": ocr_job.engine if ocr_job else None,
-        "ocr_profile": ocr_job.profile if ocr_job else None})
+        "ocr_profile": ocr_job.profile.name if ocr_job else None})
     took_lock = acquire_lock()
     try:
         convert_library(args, ocr_job, do_stt)

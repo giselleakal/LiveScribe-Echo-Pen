@@ -98,6 +98,19 @@ def check_ocr():
                   f"profile {ocr.default_profile_name()}")
 
 
+def check_vocabulary():
+    import ocr
+    if not ocr.profile().vocab_margin:
+        return Result("vocabulary", OK, "not used by the OCR profile")
+    words = ocr.vocabulary()
+    if not words:
+        return Result("vocabulary", WARN, "no word list, so OCR can't prefer "
+                      "real words", "sudo apt install wamerican")
+    private = " + training/private/vocabulary.txt" \
+        if os.path.exists(ocr.USER_VOCABULARY) else ""
+    return Result("vocabulary", OK, f"{len(words)} known words{private}")
+
+
 def check_stt():
     import stt
     if not stt.available():
@@ -207,7 +220,8 @@ def check_logs():
     return Result("logs", OK, "logs/echo.jsonl writable")
 
 
-CHECKS = (check_python, check_venv, check_pycairo, check_ocr, check_stt,
+CHECKS = (check_python, check_venv, check_pycairo, check_ocr,
+          check_vocabulary, check_stt,
           check_dumpscribe, check_pen, check_library, check_state,
           check_lock, check_push, check_logs)
 

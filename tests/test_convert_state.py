@@ -113,16 +113,16 @@ class OcrBookkeepingTest(unittest.TestCase):
         self.recognized = "hello"
         patches = [
             mock.patch.object(convert.ocr, "trocr_available", lambda: True),
-            mock.patch.object(convert.ocr, "trocr_image_to_text",
+            mock.patch.object(convert.ocr, "recognize",
                               self.fake_recognize),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
 
-    def fake_recognize(self, png_path, prof=None):
+    def fake_recognize(self, png_paths, prof=None):
         self.calls += 1
-        if self.interrupt_on and self.interrupt_on in png_path:
+        if self.interrupt_on and self.interrupt_on in png_paths[0]:
             raise KeyboardInterrupt
         if self.fail_ocr:
             raise RuntimeError("model unavailable")

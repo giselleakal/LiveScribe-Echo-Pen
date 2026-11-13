@@ -36,8 +36,9 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(warn.call_args[0][1], "ocr.unknown_profile")
 
     def test_profile_is_part_of_the_reuse_key(self):
-        a = convert.OcrJob("trocr", "eng", 6, "default").settings()
-        b = convert.OcrJob("trocr", "eng", 6, "legacy").settings()
+        a = convert.OcrJob("trocr", "eng", 6, ocr.profile("default"))
+        b = convert.OcrJob("trocr", "eng", 6, ocr.profile("legacy"))
+        a, b = a.settings(), b.settings()
         self.assertNotEqual(a, b)
 
 
@@ -148,8 +149,8 @@ class EvalHarnessTest(unittest.TestCase):
                 {"id": "missing", "page": "9.9.9.9", "truth": "x"}]}, f)
         patches = [
             mock.patch.object(ocr, "trocr_available", lambda: True),
-            mock.patch.object(ocr, "trocr_image_to_text",
-                              lambda png, prof=None: "hello"),
+            mock.patch.object(ocr, "recognize",
+                              lambda paths, prof=None: "hello"),
         ]
         for p in patches:
             p.start()
