@@ -18,7 +18,10 @@ go through stages quickly; they still go through all of them.
 ```
 
 Read `AGENTS.md` before stage 2. Its rules override anything here, and the
-first one matters most: **notes never go in the repository.**
+first one matters most: **notes never go in the repository.** It links
+`docs/architecture.md` (how the parts fit, files on disk, the API) and
+`docs/testing.md` (every check, how to write tests); read the parts your
+feature touches.
 
 ## 0. Before anything
 
@@ -143,7 +146,8 @@ end to end.
 
 ## 6. Verify
 
-Run these, and report the actual results:
+Run the checks from `docs/testing.md` that match what changed, and
+report the actual results, including any skipped tests:
 
 | Check | Command |
 |---|---|
@@ -179,7 +183,10 @@ stated, not implied.
    - [ ] <anything not verified, and why>
    ```
 
-3. Check the PR body itself for note content.
-4. Ask **"Shall I push the branch and open the pull request?"** Push and run
+3. If the feature changes files on disk, the API or a command, add its
+   one-time steps to `docs/upgrading.md` and its contracts to
+   `docs/architecture.md`, in the same branch.
+4. Check the PR body itself for note content.
+5. Ask **"Shall I push the branch and open the pull request?"** Push and run
    `gh pr create` only after a clear yes. Never push to `master` and never
    force-push.

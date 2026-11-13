@@ -103,6 +103,9 @@ What to look for:
 Set `ECHO_LOG_LEVEL=DEBUG` and re-run to get per-page and per-request
 detail.
 
+What each file on disk holds, and every log event, is listed in
+`docs/architecture.md`.
+
 ## L3: state files (minutes)
 
 The pipeline is incremental. "Nothing changes" usually means the state

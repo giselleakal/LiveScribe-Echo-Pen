@@ -5,6 +5,22 @@ pen (vendored C tool), render pages to SVG + OCR, serve a static site.
 Verification is `./run test` (stdlib unittest, no network, no pen) plus
 running the pipeline.
 
+## Where to find things
+
+Everything needed to run, change and verify this project is in the
+repository. Read the doc for the area before changing it.
+
+| Need | Read |
+|---|---|
+| rules for working here (this file) | `AGENTS.md` |
+| how the parts fit, files on disk, API, log events | [`docs/architecture.md`](docs/architecture.md) |
+| every check, the test map, writing tests | [`docs/testing.md`](docs/testing.md) |
+| upgrading an existing install, one-time steps per change | [`docs/upgrading.md`](docs/upgrading.md) |
+| install, daily use, troubleshooting (for people) | [`README.md`](README.md), [`CHEATSHEET.md`](CHEATSHEET.md) |
+| measuring and improving OCR | [`training/README.md`](training/README.md) |
+| planned features | [`future_features/README.md`](future_features/README.md) |
+| guided feature work / debugging | `.agents/skills/add-feature/`, `.agents/skills/debug/` |
+
 ## Never put notes in the repository
 
 **This repository is public. Everything committed, including commit
@@ -31,6 +47,30 @@ explicitly asks for that commit.
 Before every commit, read `git diff --cached`. If anything above shows up,
 stop and ask. Do not "clean it up later": removing data from published
 history needs the repository owner and a force-push.
+
+## Starting the application
+
+Do these in order whenever you start (or restart) the application:
+
+1. `git status` and `git log -1 --oneline`: know what is checked out, and
+   don't touch uncommitted work you didn't make.
+2. If the code changed since the server was last started, stop the
+   running `./run` first (Ctrl+C in its terminal). Then follow
+   [`docs/upgrading.md`](docs/upgrading.md) once for each change pulled.
+3. `./run doctor`. Fix every `✘`; a `!` only matters if you need that
+   feature (pen, OCR, STT, push).
+4. `./run test`. Check that nothing is skipped unexpectedly (see
+   [`docs/testing.md`](docs/testing.md)).
+5. Start the server. `./run` converts, then serves in the foreground
+   until Ctrl+C, so run it in its own terminal, or in the background:
+   `nohup ./run > logs/serve.out 2>&1 &`. It is up when
+   `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/` prints
+   `200`.
+6. Pen work only when the user says the pen is attached: `./run sync`
+   asks for sudo. Never answer the clear-the-pen prompt on the user's
+   behalf.
+7. If anything misbehaves, use the `debug` skill and start from
+   `./run logs --errors --run last`.
 
 ## Entry point
 
@@ -151,22 +191,25 @@ history needs the repository owner and a force-push.
 
 ## Verification
 
+The full list of checks, the test map and how to write tests are in
+[`docs/testing.md`](docs/testing.md). The rules:
+
 - `./run test` must pass before every commit; add or update a focused test
   first for behaviour changes. Tests are stdlib `unittest`, deterministic,
   with no network or pen. Use `tests/fixtures.py` for synthetic `.stf`
   pages and sessions.
-- Check Python 3.10 compatibility when touching syntax:
-  `uv run --python 3.10 python -m unittest discover -s tests -t .`. Tests
-  that need pycairo skip there.
-- After editing `run` or `scripts/*.sh`, run `bash -n run`, and also
-  `shellcheck run` if it is installed (`uvx --from shellcheck-py shellcheck run`
-  works without installing).
+- Run the checks for what you touched: Python 3.10 for syntax, shellcheck
+  for `run` and `scripts/*.sh`, `scripts/check-dumpscribe.sh` for the C.
+- A change that alters files on disk, the API or a command adds its
+  one-time steps to [`docs/upgrading.md`](docs/upgrading.md), and its
+  contract changes to [`docs/architecture.md`](docs/architecture.md).
 - OCR changes: add a `Profile` setting in `src/ocr.py` (never change
   `legacy` or `beam`), and compare one setting at a time with
   `./run ocr-eval --set key=value` on the dev split. Check the test split
   once, at the end, and don't tune thresholds to the samples.
-- `vendor/dumpscribe.c` cannot be built without openobex; at least
-  syntax-check edits, and say so when the real build was not run.
+- `vendor/dumpscribe.c` cannot be built without openobex:
+  `scripts/check-dumpscribe.sh` then only syntax-checks it, and you must
+  say so.
 
 ## Debugging
 
