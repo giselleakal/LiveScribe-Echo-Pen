@@ -42,12 +42,13 @@ import urllib.error
 import urllib.request
 import uuid
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-OUT = os.path.join(ROOT, "output")
+import paths
+
+ROOT = paths.ROOT
+OUT = paths.OUT
 PAGES_OUT = os.path.join(OUT, "pages")
 AUDIO_OUT = os.path.join(OUT, "audio")
-DATA_DIR = os.path.join(ROOT, "data")
+DATA_DIR = paths.DATA
 INDEX = os.path.join(OUT, "index.json")
 
 STATE_PATH = os.path.join(ROOT, ".push-state.json")

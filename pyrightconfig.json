@@ -1,0 +1,7 @@
+{
+  "include": ["src", "tests", "scripts", "vendor"],
+  "extraPaths": ["src", "vendor"],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "reportMissingModuleSource": "none"
+}

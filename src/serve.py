@@ -23,11 +23,12 @@ import urllib.parse
 # stdlib + the vendored parsestf/ocr at module load; cairo and torch stay
 # lazy inside convert.py/ocr.py, so serving stays dependency-light.
 import convert
+import paths
 import scribe
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-OUT = os.path.join(ROOT, "output")
+ROOT = paths.ROOT
+OUT = paths.OUT
+CONVERT_PY = os.path.join(paths.SRC, "convert.py")
 INDEX = os.path.join(OUT, "index.json")
 
 # Path-traversal-safe id shapes (reject / \ .. leading '.', NUL, unicode.)
@@ -663,7 +664,7 @@ _LAST_GOOD = None
 
 def find_session_dirs(session_id):
     """Return every raw pen session directory for ``session_id``."""
-    replay = os.path.join(ROOT, "data", "userdata")
+    replay = os.path.join(paths.DATA, "userdata")
     return glob.glob(os.path.join(
         replay, "*", "Paper Replay", "*", "*", "sessions", session_id))
 
@@ -678,14 +679,14 @@ def _reconcile():
     env = dict(os.environ)
     env["ECHO_LOCK_HELD"] = "1"
     subprocess.run(
-        [sys.executable, os.path.join(ROOT, "src", "convert.py")],
+        [sys.executable, CONVERT_PY],
         env=env, check=False)
 
 
 def delete_page(page_id):
     """Remove a page everywhere: raw dump, output, and incremental state."""
     shutil.rmtree(os.path.join(OUT, "pages", page_id), ignore_errors=True)
-    shutil.rmtree(os.path.join(ROOT, "data", "data", page_id),
+    shutil.rmtree(os.path.join(paths.DATA, "data", page_id),
                   ignore_errors=True)
     state = convert.load_state()
     state["page_entries"].pop(page_id, None)
@@ -727,7 +728,7 @@ def _run_convert_locked(argv):
         env = dict(os.environ)
         env["ECHO_LOCK_HELD"] = "1"
         proc = subprocess.run(
-            [sys.executable, os.path.join(ROOT, "src", "convert.py")] + argv,
+            [sys.executable, CONVERT_PY] + argv,
             env=env, check=False)
         return proc.returncode == 0
     finally:
@@ -804,7 +805,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         # the id must actually exist before we spend a long transcription
         if kind == "page":
-            if not os.path.isdir(os.path.join(ROOT, "data", "data", ident)):
+            if not os.path.isdir(os.path.join(paths.DATA, "data", ident)):
                 send_json(self, 404,
                           {"ok": False, "error": "no such page"})
                 return

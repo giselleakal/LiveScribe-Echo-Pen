@@ -166,6 +166,10 @@ case "$mode" in
     clean-pen)
         clean_pen
         ;;
+    test)
+        shift
+        exec "$PYTHON" -m unittest discover -s "$ROOT/tests" -t "$ROOT" "$@"
+        ;;
     sync)
         shift
         presetup

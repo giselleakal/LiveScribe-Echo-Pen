@@ -1,0 +1,10 @@
+# Repository style: %-formatting is used throughout; tests import the
+# `tests` package first on purpose (it sandboxes ECHO_ROOT).
+target-version = "py310"
+extend-exclude = ["vendor"]
+
+[lint]
+ignore = ["UP031", "UP032"]
+
+[lint.per-file-ignores]
+"tests/*" = ["I001", "E402"]

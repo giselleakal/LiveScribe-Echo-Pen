@@ -31,9 +31,8 @@ import sys
 import tempfile
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-sys.path.insert(0, os.path.join(ROOT, "vendor"))
+import paths
+sys.path.insert(0, paths.VENDOR)
 import parsestf
 import ocr
 import stt
@@ -46,6 +45,7 @@ RENDER_VERSION = 4          # bump to force re-render on next ./run (see main)
 PAGE_PADDING = 120          # STF units of margin around ink in each render
 MIN_CANVAS = 600            # minimum page size in STF units (~2 grid cells)
 
+ROOT = paths.ROOT
 STATE_PATH = os.path.join(ROOT, ".convert-state.json")
 # user-assigned friendly names for pen notebook guids; written by the
 # site's rename button, read here so index.json carries the alias
@@ -670,8 +670,8 @@ def main(argv=None):
         # released on process exit, so an early exception can't leak it
         atexit.register(release_lock)
 
-    data_dir = os.path.join(ROOT, "data")
-    out_dir = os.path.join(ROOT, "output")
+    data_dir = paths.DATA
+    out_dir = paths.OUT
     pages_out = os.path.join(out_dir, "pages")
     audio_out = os.path.join(out_dir, "audio")
     os.makedirs(pages_out, exist_ok=True)
