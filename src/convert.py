@@ -42,7 +42,7 @@ PAGE_W, PAGE_H = 4963, 6278  # STF "dot" units; page size used by stf2pdf
 GRID = 83                     # visible dot-grid spacing in STF units
 INK = (12, 22, 90)            # Livescribe ink blue
 
-RENDER_VERSION = 3          # bump to force re-render on next ./run (see main)
+RENDER_VERSION = 4          # bump to force re-render on next ./run (see main)
 PAGE_PADDING = 120          # STF units of margin around ink in each render
 MIN_CANVAS = 600            # minimum page size in STF units (~2 grid cells)
 
@@ -505,6 +505,8 @@ def collect_sessions(data_dir):
                 if times:
                     s["captured"] = pen_ms_to_iso(times[0], offset)
                     s["captured_end"] = pen_ms_to_iso(times[1], offset)
+                    s["pen_tstart"] = times[0]
+                    s["pen_tend"] = times[1]
             alias = names.get(notebook)
             if alias:
                 s["notebook_name"] = alias
@@ -684,6 +686,8 @@ def main(argv=None):
         # Renderer changed (e.g. ink-bounds clipping): ignore the sources
         # signature cache so every page is re-rendered once, then go back to
         # incremental. Keep page_entries (rect/svg/thumb paths are stable).
+        # v4: seeds pen_tmin/pen_tmax capture bounds into page_entries so
+        # capture stamps can be frozen against future offset changes.
         print("renderer changed (v%s -> v%s); re-rendering all pages"
               % (state.get("render_version"), RENDER_VERSION))
         state["sources"] = {}
@@ -740,8 +744,20 @@ def main(argv=None):
             "thumb": "pages/%s/thumb.png" % page_id,
         }
         if offset is not None and tmin is not None:
-            entry["captured"] = pen_ms_to_iso(tmin, offset)
-            entry["captured_end"] = pen_ms_to_iso(tmax, offset)
+            pt = prev or {}
+            if pt.get("captured") and pt.get("pen_tmin") == tmin:
+                # freeze: keep stamps from the offset in effect when the
+                # page was synced (see the session-freeze note below)
+                entry["captured"] = pt["captured"]
+                if tmax == pt.get("pen_tmax"):
+                    entry["captured_end"] = pt.get("captured_end")
+                else:
+                    entry["captured_end"] = pen_ms_to_iso(tmax, offset)
+            else:
+                entry["captured"] = pen_ms_to_iso(tmin, offset)
+                entry["captured_end"] = pen_ms_to_iso(tmax, offset)
+            entry["pen_tmin"] = tmin
+            entry["pen_tmax"] = tmax
         title = titles.get(page_id)
         if title:
             entry["title"] = title
@@ -788,6 +804,17 @@ def main(argv=None):
                 for aac in s["audio"]}
         sigs = {rel: file_sig(os.path.join(ROOT, rel)) for rel in sigs}
         prev = state.get("session_entries", {}).get(s["id"])
+        # Freeze stamps computed under the offset in effect when the
+        # session was downloaded: a pen-clock correction rewrites the
+        # global offset, which would otherwise mis-stamp every asset
+        # recorded before the fix (their pen times encode the old clock).
+        if prev and prev.get("captured") and \
+                prev.get("pen_tstart") == s.get("pen_tstart"):
+            s["captured"] = prev["captured"]
+            if prev.get("pen_tend") == s.get("pen_tend"):
+                s["captured_end"] = prev.get("captured_end")
+            # else: end grew (appended audio part); keep the fresh end,
+            # which was converted with the offset valid for that part
         reuse = (not args.force) and bool(sigs) and prev is not None and \
             prev.get("pages") == s["pages"] and \
             prev.get("notebook") == s["notebook"]
@@ -836,6 +863,9 @@ def main(argv=None):
         entry = {
             "urls": s["urls"], "pages": s["pages"], "notebook": s["notebook"],
         }
+        for k in ("captured", "captured_end", "pen_tstart", "pen_tend"):
+            if s.get(k) is not None:
+                entry[k] = s[k]
         # carry forward transcripts/stt markers from a previous run so a
         # non-stt convert doesn't drop them; sessions rebuilt every run
         if isinstance(prev, dict):
