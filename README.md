@@ -65,6 +65,14 @@ lists every command.
                 └────── src/serve.py ──┘  (HTTP server)
 ```
 
+## Upgrading
+
+Pulled new code onto a machine that already has a library? Stop the
+running `./run`, pull, run `./run doctor`, and do the one-time steps in
+[`docs/upgrading.md`](docs/upgrading.md) for each change. Maintainers
+(people or agents) start from [`AGENTS.md`](AGENTS.md), which links the
+architecture and testing docs.
+
 ## Checking a machine
 
 `./run doctor` checks everything this README assumes and prints one fix
@@ -243,7 +251,9 @@ card (same signing/dedup path). Config is via environment:
 data/      raw output of dumpscribe              (gitignored)
 output/    generated site content                (gitignored)
 logs/      structured logs, debug reports        (gitignored)
-scripts/   windows-connect.ps1, build-dumpscribe.sh, push test harness
+docs/      for maintainers: architecture, testing, upgrading an install
+scripts/   windows-connect.ps1, build-dumpscribe.sh, check-dumpscribe.sh,
+           push test harness
 src/       convert.py (pipeline), serve.py (web server + API), webpage.py
            + web/ (the page: markup, style.css, app.js), ocr.py + ocr_eval.py,
            stt.py, scribe.py (Hermes push), telemetry.py (logs),
