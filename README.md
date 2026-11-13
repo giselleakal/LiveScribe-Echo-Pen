@@ -13,13 +13,10 @@ server publishes them with full-text page search.
 
 ## Handwriting recognition training
 
-Ground-truth pairs for improving the OCR: the original handwriting, what
-the OCR actually produced, and what it should have produced. Full doc:
-[`training/README.md`](training/README.md).
-
-| Original | Transcription | Correction |
-|---|---|---|
-| ![sample 05](training/samples/sample_05.png) | hones are attached<br>a<br>too-to-to-to-to-to-to-to-to-to-to-<br>O After that I need to determine<br>D. D. D.<br>if these switches are COR-enabled. | phones are attached to.<br><br>(5) After that I need to determine if these switches are CER-enabled. |
+Ground-truth samples for measuring and improving the OCR live in
+[`training/README.md`](training/README.md). This repository is public:
+only commit samples whose content is safe to publish (see "Privacy" in
+that doc).
 
 ## Quick start
 

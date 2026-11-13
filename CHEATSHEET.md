@@ -7,7 +7,7 @@ each step has a "you should see" note and a "trouble" fix at the bottom.
 > typed in the **Linux terminal (WSL)**, in the project folder, like this:
 >
 > ```
-> cd /home/giselle/echo
+> cd ~/echo
 > ./run sync
 > ```
 
@@ -28,7 +28,7 @@ each step has a "you should see" note and a "trouble" fix at the bottom.
    .\windows-connect.ps1
    ```
    (If drag-and-drop doesn't work: the folder is
-   `\\wsl.localhost\<distro>\home\giselle\echo\scripts` — navigate there in
+   `\\wsl.localhost\<distro>\home\<your-linux-user>\echo\scripts` — navigate there in
    PowerShell, or just use whatever path worked for you tonight.)
 3. Go back to the **Linux terminal** and check the pen is visible:
    ```
@@ -42,7 +42,7 @@ each step has a "you should see" note and a "trouble" fix at the bottom.
 ### Step 3 — Pull the notes off the pen and look at them
 In the Linux terminal, in the project folder:
 ```
-cd /home/giselle/echo
+cd ~/echo
 ./run sync
 ```
 - It may ask for a **sudo password** — that is **normal and expected**. Type
@@ -67,7 +67,7 @@ Then, to see your notes as a website:
 
 | Command | What it does | When to use |
 |---|---|---|
-| `cd /home/giselle/echo` | Go to the project folder | Every time you open a terminal |
+| `cd ~/echo` | Go to the project folder | Every time you open a terminal |
 | `./run sync` | Download notes from pen + render | After plugging pen in |
 | `./run` | Start the website (stays running) | To view notes |
 | `./run convert` | Just re-render pages (no pen needed) | After editing data |
@@ -83,7 +83,7 @@ Then, to see your notes as a website:
 ## Tomorrow night's plan (with the pen's new notes)
 
 1. Plug in pen → PowerShell bridge → `lsusb` check (Steps 1–2).
-2. `cd /home/giselle/echo` then `./run sync` → downloads the new notes.
+2. `cd ~/echo` then `./run sync` → downloads the new notes.
 3. `./run` → open **http://localhost:8000** → check the new pages appear.
 4. Then we'll work on the **transcription training**: teaching Hermes to read
    your handwriting better by reviewing/correcting the text.
