@@ -59,6 +59,7 @@ generated and gitignored.
 | `.push-state.json` | scribe | scribe | `{notes: {id: {sig, request_id, accepted, pushed_at}}}` |
 | `logs/echo.jsonl` (+ `.1`) | every module | `./run logs`, doctor | one JSON record per line; `./run` rotates it at 5 MB |
 | `titles.json`, `notebook_names.json` | serve (UI) | convert | user-typed names; **tracked**, see AGENTS.md |
+| `training/private/eval.json`, `vocabulary.txt` | the user | ocr-eval, ocr | OCR ground truth and private words; never committed |
 | `.env` | the user | `run` | `ECHO_SCRIBE_SECRET`, `ECHO_TZ`, … (never committed) |
 
 ### `output/index.json`
@@ -88,6 +89,27 @@ when every line was read; a partial result keeps its `text` with
 
 The state is saved after every OCR'd page and STT'd session, so an
 interrupted run keeps its finished work.
+
+## OCR profiles
+
+A `Profile` in `src/ocr.py` bundles every choice that changes recognized
+text:
+- segmentation: `max_line_aspect`, `oversize_ratio`, `lines`
+- rendering: `render`, `pen_widths`, `tesseract_on_ink`
+- decoding: `beams`, `no_repeat_ngram`, `vocab_margin`
+
+The full settings, serialized, are each page's OCR reuse key, so changing a
+profile re-transcribes pages once.
+
+```text
+page strokes ─► lines (vertical bands | pen order) ─► wide lines split at word gaps
+            ─► line images (plain | normalized × pen widths)
+            ─► TrOCR n-best per image, scored ─► choose(): best score,
+               near-ties go to fewer unknown words ─► text
+```
+
+`legacy` and `beam` are frozen for comparison; new ideas are new
+settings, measured with `./run ocr-eval --set`.
 
 ## HTTP API
 
@@ -121,6 +143,7 @@ in serve, `request_id`. Note text is never logged, only lengths.
 | `page.failed`, `stf.truncated` | convert | a source file is corrupt or cut short |
 | `ocr.page`, `ocr.line_failed`, `ocr.page_failed` | convert | OCR per page (DEBUG) and its failures |
 | `ocr.engine_fallback`, `ocr.unavailable`, `stt.unavailable` | convert | missing engines |
+| `ocr.unknown_profile`, `ocr.scores_unavailable` | ocr | bad `ECHO_OCR_PROFILE`; transformers too old to score candidates |
 | `stt.session`, `stt.session_failed` | convert | speech-to-text per recording |
 | `audio.copy_failed`, `session.missing_page` | convert | session problems |
 | `lock.wait`, `lock.busy` | convert | two runs collided; `holder_pid` |

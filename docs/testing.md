@@ -14,7 +14,7 @@ Rules (test first for behaviour changes, synthetic data only) are in
 | pen client (C) | `scripts/check-dumpscribe.sh` | editing `vendor/dumpscribe.c` |
 | Hermes push end to end | `python3 scripts/test-push-sender.py` | editing `src/scribe.py` |
 | setup of this machine | `./run doctor` | before starting, and after an upgrade |
-| OCR accuracy | `./run ocr-eval` (see [`training/README.md`](../training/README.md)) | OCR changes, on real samples |
+| OCR accuracy | `./run ocr-eval` (see [`training/README.md`](../training/README.md)) | OCR changes, on real samples: one `--set` change at a time on dev, `--split test` once at the end |
 
 Read the result, not just the exit code:
 
@@ -40,6 +40,7 @@ Read the result, not just the exit code:
 | `test_convert_pipeline.py` | a whole convert run against synthetic data | subprocess in its own root |
 | `test_convert_state.py` | incremental state, lock, OCR/STT reuse, corrupt sources, interruptions | in-process `convert.main()` |
 | `test_ocr.py` | profiles, engine choice, line splitting, `ocr-eval` scoring | direct calls, mocked recognizer |
+| `test_ocr_accuracy.py` | normalized rendering, pen-order lines, candidate choice, vocabulary, eval split/`--set`/interval | fake TrOCR (`FakeTrOCR`), direct calls |
 | `test_stt.py` | audio windows and stitching | direct calls |
 | `test_serve_api.py` | every API guard and handler | in-process server on a random loopback port |
 | `test_scribe.py` | signing, chunking, push results, queue, CLI | fake `post_body` |
