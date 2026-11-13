@@ -74,6 +74,8 @@ Then, to see your notes as a website:
 | `./run ocr` | Re-read handwriting into text | If pages lack transcription |
 | `./run stt` | Transcribe the audio recordings | On-demand |
 | `./run push` | Send notes to Hermes (my assistant) | When Hermes is set up |
+| `./run doctor` | Check that everything is set up; tells you the fix | When anything seems wrong |
+| `./run logs --errors` | Show the recent problems | After an error message |
 | `Ctrl + C` | Stop whatever is running | To quit the server |
 | `lsusb` | Check pen is attached | Step 2 check |
 | `clear` | Clean the terminal screen | When it gets messy |
@@ -94,13 +96,14 @@ Then, to see your notes as a website:
 
 | Problem | What to do |
 |---|---|
+| Anything at all | Run `./run doctor` first: every `!` line says what to type to fix it. |
 | `lsusb` shows no pen | Re-run the PowerShell bridge step. Try another cable. Check pen is on. |
 | `sudo` asks for password | Normal — type your Linux password, press Enter. |
 | Says "pen not attached" | The bridge step didn't stick; redo PowerShell step. |
 | Browser won't load localhost:8000 | Make sure `./run` is still running in the terminal. |
 | Terminal "stuck"/no prompt | That's usually the server running — press **Ctrl + C** to get your prompt back. |
 | Typed something wrong | Press the **↑ (up arrow)** to get the last command and fix it; **Tab** autocompletes. |
-| Everything's confusing | You can always ask me (in this chat) — I'll tell you exactly what to type. |
+| Everything's confusing | You can always ask me (in this chat) — I'll tell you exactly what to type. Running `./run debug-report` first gives me the details without any of your notes. |
 
 ---
 
@@ -110,6 +113,7 @@ Then, to see your notes as a website:
 3. **Ctrl + C** = stop whatever is running / get your prompt back.
 4. **You can't break the pen** — these commands only *read* notes off it
    (the one that deletes from the pen, `./run clean-pen`, is the ONLY one that
-   erases, and it asks you "y/N" first — say **N** unless you really mean it).
+   erases; it asks you "y/N" first, and it refuses to erase anything unless
+   your pages AND audio were saved first. Say **N** unless you really mean it).
 
 If you ever get lost: type `./run help` — it lists every command.
