@@ -16,6 +16,27 @@ recovered from Internet Archive snapshots of the /en-us/ paths.
 | notebook_3.pdf | 25    | 5,897,802 | 642607eed025       | (captured via /en-us/, gzip; gunzipped)   |
 | notebook_4.pdf | 25    | 5,897,978 | ec93cc892a75       | web.archive.org/web/20171011id_/…         |
 
+| notebook_4.pdf | 25    | 5,897,978 | ec93cc892a75       | web.archive.org/web/20171011id_/…         |
+| settings_sheet.pdf | 1 | 16,951,264 | 57701c2f29f2    | calculator & time/date settings (Echo)    |
+
+## Fixing the pen's clock (it reads ~1972 — factory default)
+
+The pipeline does NOT need this: dumpscribe rewrites `data/time_offset`
+(systime - pentime) at every sync, so all app timestamps are correct
+even with the pen clock wrong. The only things wrong are the pen's own
+OLED display and the PRS- ids (cosmetic).
+
+If you want the pen display correct, use the official settings sheet:
+print `settings_sheet.pdf` (same dot-paper rules — color laser, actual
+size), then on the sheet fill in the current date and time and tap the
+"send"/submit control with the pen. The pen's clock is then right, and
+the next `./run sync` simply computes a new (small) offset — older
+stamps stay correct because they were computed with the old offset.
+Alternative: connect the pen once to official Echo Desktop on Windows,
+which syncs the clock on connect — but its driver may claim the USB
+device and interfere with the WSL usbipd attach used by `./run sync`;
+remove it afterwards if you go that route.
+
 Verify before printing: `sha256sum notebook_*.pdf` and
 `pdfinfo notebook_1.pdf` (expect 25 pages, 612x792 pts, not encrypted).
 
