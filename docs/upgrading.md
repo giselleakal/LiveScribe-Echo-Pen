@@ -45,3 +45,8 @@ Nothing else needs migrating:
 | Expect the first `./run ocr` to re-transcribe every page once | the `default` profile changed, and a profile's settings are each page's reuse key |
 | Optional: `training/private/vocabulary.txt`, one word per line | names and acronyms the word prior should know |
 | Before trusting `default`: mark some samples `"split": "test"` and compare `./run ocr-eval --profile beam` with `./run ocr-eval` | it was not measured on real handwriting; `ECHO_OCR_PROFILE=beam` keeps the previous behaviour |
+
+## UI polish (#6)
+
+Nothing to migrate. Restart the server (every upgrade does), then
+reload the page; it is never cached.

@@ -34,7 +34,9 @@ carries and starts the processes above.
 | `src/ocr.py` | recognizers (TrOCR, Tesseract) and OCR profiles | torch/transformers (lazy) |
 | `src/ocr_eval.py` | scores OCR against ground truth (CER/WER) | `convert`, `ocr` |
 | `src/stt.py` | speech-to-text (Moonshine) and audio decoding | torch/transformers, imageio-ffmpeg (lazy) |
-| `src/serve.py` | HTTP server, the web page, guarded POST API | stdlib only, `convert`, `scribe` |
+| `src/serve.py` | HTTP server and guarded POST API | stdlib only, `convert`, `scribe`, `webpage` |
+| `src/webpage.py` | builds the page from `index.json`, escaping every value | stdlib only |
+| `src/web/` | `page.html` (skeleton), `style.css`, `app.js`, inlined per request | — |
 | `src/scribe.py` | Hermes push: notes, signing, chunking, durable queue, dedup | stdlib |
 | `src/telemetry.py` | structured logs, correlation ids, `./run logs` | stdlib |
 | `src/doctor.py` | `./run doctor` checks and `./run debug-report` | stdlib |
@@ -110,6 +112,27 @@ page strokes ─► lines (vertical bands | pen order) ─► wide lines split a
 
 `legacy` and `beam` are frozen for comparison; new ideas are new
 settings, measured with `./run ocr-eval --set`.
+
+## Web page
+
+```text
+GET /  ─► webpage.build_index()
+            reads output/index.json (last good page if it is mid-write)
+            cards: page_card() / session_card()  ─► string.Template(page.html)
+                                                     $style  = web/style.css
+                                                     $script = web/app.js
+                                                     $body   = the cards
+```
+
+- `app.js` has a few shared helpers: `toast()`, `busy()`, `post()`, and
+  `run()`, which wraps a button, a request and the result handling.
+- Buttons are dispatched through the `ACTIONS` table (CSS selector →
+  handler). A new button adds one row.
+- The search filter and multi-select listen for the `echo:filtered`
+  event.
+- Layout contract: every element's size is known before images, audio or
+  scripts load. `./run ui-check` measures that (layout shift) and takes
+  the screenshots for PRs.
 
 ## HTTP API
 

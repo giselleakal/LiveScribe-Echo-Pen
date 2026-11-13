@@ -156,6 +156,8 @@ Do these in order whenever you start (or restart) the application:
   - Animations go inside `@media (prefers-reduced-motion: no-preference)`.
   - Results are toasts (`toast()` in `app.js`); destructive steps keep
     `confirm`/`prompt`. New buttons join the `ACTIONS` table.
+  - After a UI change, run `./run ui-check` and put its screenshots in
+    the PR. They show a synthetic library only.
 - Notebook display names live in `notebook_names.json` (guid -> friendly
   name, edited via `/api/rename`). Per-asset titles live in `titles.json`
   (asset id -> title, via `/api/title`).

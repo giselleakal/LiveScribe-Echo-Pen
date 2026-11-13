@@ -14,6 +14,7 @@ Rules (test first for behaviour changes, synthetic data only) are in
 | pen client (C) | `scripts/check-dumpscribe.sh` | editing `vendor/dumpscribe.c` |
 | Hermes push end to end | `python3 scripts/test-push-sender.py` | editing `src/scribe.py` |
 | setup of this machine | `./run doctor` | before starting, and after an upgrade |
+| web page layout + screenshots | `./run ui-check` (needs Chromium) | any change to `src/webpage.py` or `src/web/`; attach the screenshots to the PR |
 | OCR accuracy | `./run ocr-eval` (see [`training/README.md`](../training/README.md)) | OCR changes, on real samples: one `--set` change at a time on dev, `--split test` once at the end |
 
 Read the result, not just the exit code:
@@ -26,6 +27,10 @@ Read the result, not just the exit code:
 - **`check-dumpscribe.sh`** prints `full build OK` only when openobex is
   installed. `syntax OK` means it was checked against
   `scripts/obex-stub/` only; say "syntax-checked, not built" in the PR.
+- **`ui-check`** fails when layout shift exceeds `--budget` (0.05). It uses
+  a synthetic library, so its screenshots are safe to publish. It writes
+  them to `logs/ui-check/`, which is not committed. Upload them with the
+  PR, for example to a secret gist, and link them in the body.
 - **Things this repository cannot test** on a machine without the
   hardware or models: a real pen sync or wipe, a real dumpscribe build,
   TrOCR/Moonshine inference, and OCR accuracy. Name them as unverified.
@@ -43,6 +48,7 @@ Read the result, not just the exit code:
 | `test_ocr_accuracy.py` | normalized rendering, pen-order lines, candidate choice, vocabulary, eval split/`--set`/interval | fake TrOCR (`FakeTrOCR`), direct calls |
 | `test_stt.py` | audio windows and stitching | direct calls |
 | `test_serve_api.py` | every API guard and handler | in-process server on a random loopback port |
+| `test_webpage.py` | page markup: sized images, escaping, empty states, no `alert()`, motion gated | builds the page from a written `index.json` |
 | `test_scribe.py` | signing, chunking, push results, queue, CLI | fake `post_body` |
 | `test_telemetry.py` | record shape, redaction, correlation, rotation, CLI | reads `logs/echo.jsonl` |
 | `test_doctor.py` | doctor checks, debug report without note content | direct calls |
