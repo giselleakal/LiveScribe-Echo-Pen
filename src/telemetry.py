@@ -47,6 +47,9 @@ SECRET_KEYS = ("secret", "token", "password", "authorization", "cookie",
 # record's __dict__ came from ``extra=`` and is emitted as a field
 _STANDARD_ATTRS = set(vars(logging.LogRecord(
     "x", logging.INFO, "x", 0, "x", None, None))) | {"message", "asctime"}
+# fields every record owns; ``extra=`` values never replace them
+FIXED_FIELDS = ("ts", "level", "component", "event", "run_id", "pid",
+                "request_id")
 
 # injectable clock for durations; tests replace it. Record timestamps come
 # from the logging module's own wall-clock stamp (record.created).
@@ -157,7 +160,9 @@ class JsonFormatter(logging.Formatter):
         if rid:
             out["request_id"] = rid
         for key, value in vars(record).items():
-            if key not in _STANDARD_ATTRS and not key.startswith("_"):
+            if key in _STANDARD_ATTRS or key.startswith("_"):
+                continue
+            if key not in FIXED_FIELDS:
                 out[key] = value
         if record.exc_info and record.exc_info[1] is not None:
             exc = record.exc_info[1]
@@ -334,15 +339,38 @@ def parse_fields(pairs):
     return out
 
 
+def record_event(argv):
+    """``event <component> <name> [key=value ...] [--level LEVEL]``.
+
+    Parsed by hand: argparse before Python 3.12 rejects an option placed
+    before trailing positional ``key=value`` words, and ./run must be
+    able to write either order.
+    """
+    args = list(argv)
+    level = "INFO"
+    if "--level" in args:
+        at = args.index("--level")
+        level = args[at + 1] if at + 1 < len(args) else level
+        del args[at:at + 2]
+    if len(args) < 2:
+        print("usage: telemetry.py event <component> <name> [key=value ...] "
+              "[--level LEVEL]", file=sys.stderr)
+        return 2
+    component, name, fields = args[0], args[1], args[2:]
+    get_logger(component).log(getattr(logging, level.upper(), logging.INFO),
+                              name, extra=parse_fields(fields))
+    return 0
+
+
 def main(argv=None):
     import argparse
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["event"]:
+        return record_event(argv[1:])
     ap = argparse.ArgumentParser(description="Read or write pipeline logs.")
     sub = ap.add_subparsers(dest="command", required=True)
-    event = sub.add_parser("event", help="record one event (for ./run)")
-    event.add_argument("component")
-    event.add_argument("name")
-    event.add_argument("fields", nargs="*", help="key=value pairs")
-    event.add_argument("--level", default="INFO")
+    sub.add_parser("event", help="record one event (for ./run): "
+                                 "event <component> <name> [key=value ...]")
     logs = sub.add_parser("logs", help="print recent log records")
     logs.add_argument("--errors", action="store_true",
                       help="only warnings and errors")
@@ -352,11 +380,9 @@ def main(argv=None):
     logs.add_argument("--json", action="store_true",
                       help="print raw JSON lines")
     args = ap.parse_args(argv)
-    if args.command == "event":
-        level = getattr(logging, args.level.upper(), logging.INFO)
-        get_logger(args.component).log(level, args.name,
-                                       extra=parse_fields(args.fields))
-        return 0
+    if args.n < 1:
+        print("-n must be at least 1", file=sys.stderr)
+        return 2
     records = list(read_records())
     run = args.run
     if run == "last":

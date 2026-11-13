@@ -70,6 +70,14 @@ class DebugReportTest(unittest.TestCase):
         self.assertNotIn(NOTE_TEXT, report)
         self.assertNotIn("Private title", report)
 
+    def test_windows_user_folders_and_username_are_hidden(self):
+        with mock.patch.object(doctor.getpass, "getuser",
+                               return_value="pat"):
+            text = doctor.scrub("/mnt/c/Users/pat/echo C:\\Users\\pat\\x "
+                                "owner=pat path=/srv/pattern")
+        self.assertEqual(text, "/mnt/c/Users/<user>/echo C:\\Users\\<user>\\x "
+                               "owner=<user> path=/srv/pattern")
+
     def test_home_directory_is_written_as_tilde(self):
         home = os.path.expanduser("~")
         with mock.patch.object(doctor, "build_report",

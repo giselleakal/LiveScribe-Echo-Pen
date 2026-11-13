@@ -28,10 +28,12 @@ class ProfileTest(unittest.TestCase):
                          {"max_new_tokens": 64})
 
     def test_profile_comes_from_the_environment(self):
-        with mock.patch.dict(os.environ, {"ECHO_OCR_PROFILE": "legacy"}):
+        with mock.patch.dict(os.environ, {"ECHO_OCR_PROFILE": "Legacy"}):
             self.assertEqual(ocr.profile().name, "legacy")
-        with mock.patch.dict(os.environ, {"ECHO_OCR_PROFILE": "bogus"}):
+        with mock.patch.dict(os.environ, {"ECHO_OCR_PROFILE": "bogus"}), \
+                mock.patch.object(ocr.telemetry, "warn") as warn:
             self.assertEqual(ocr.profile().name, "default")
+        self.assertEqual(warn.call_args[0][1], "ocr.unknown_profile")
 
     def test_profile_is_part_of_the_reuse_key(self):
         a = convert.OcrJob("trocr", "eng", 6, "default").settings()
@@ -53,6 +55,16 @@ class OversizeStrokeTest(unittest.TestCase):
 
     def test_legacy_grouping_is_unchanged(self):
         self.assertEqual(len(convert.group_lines(self.strokes)), 3)
+
+    def test_tall_stroke_does_not_stretch_its_line(self):
+        margin = [(50, 0), (50, 3000)]
+        words = fixtures.text_line(100, 1400, 40)
+        line = strokes_of(words + [margin])
+        ceiling = convert.oversize_ceiling(line, 2.5)
+        frame = convert.line_frame(line, ceiling)
+        self.assertNotIn(strokes_of([margin])[0], frame)
+        self.assertGreater(len(convert.split_wide_line(line, 14.0, ceiling)),
+                           1)
 
 
 class SplitWideLineTest(unittest.TestCase):
@@ -96,10 +108,11 @@ class ScoringTest(unittest.TestCase):
     def test_manifest_validation(self):
         path = os.path.join(tempfile.mkdtemp(dir=fixtures.tests.SANDBOX),
                             "m.json")
-        with open(path, "w") as f:
-            json.dump({"samples": [{"truth": "x"}]}, f)
-        with self.assertRaises(ValueError):
-            ocr_eval.load_manifest(path)
+        for sample in ({"truth": "x"}, {"page": "1.2", "truth": None}):
+            with open(path, "w") as f:
+                json.dump({"samples": [sample]}, f)
+            with self.assertRaises(ValueError, msg=sample):
+                ocr_eval.load_manifest(path)
 
 
 @unittest.skipUnless(fixtures.has_cairo(), "pycairo not installed")

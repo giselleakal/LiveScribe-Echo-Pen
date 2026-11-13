@@ -342,7 +342,8 @@ def post_body(body, url, secret, request_id, ts=None):
             "X-Request-ID": request_id,
             "User-Agent": "echo-notebook/1.0",
         })
-    with telemetry.io_call(log, "hermes", url=url, request_id=request_id,
+    with telemetry.io_call(log, "hermes", url=url,
+                           hermes_request_id=request_id,
                            bytes=len(body)) as call:
         status, reply = _post(req)
         call["status"] = status

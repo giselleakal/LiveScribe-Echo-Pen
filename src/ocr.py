@@ -59,8 +59,15 @@ PROFILES = {
 
 
 def default_profile_name():
-    name = os.environ.get("ECHO_OCR_PROFILE", "default")
-    return name if name in PROFILES else "default"
+    """ECHO_OCR_PROFILE (any case), or "default" with a warning if unknown."""
+    raw = os.environ.get("ECHO_OCR_PROFILE", "default")
+    name = raw.strip().lower()
+    if name in PROFILES:
+        return name
+    telemetry.warn(log, "ocr.unknown_profile",
+                   "unknown ECHO_OCR_PROFILE %r; using 'default' (choices: %s)"
+                   % (raw, ", ".join(sorted(PROFILES))), requested=raw)
+    return "default"
 
 
 def profile(name=None):

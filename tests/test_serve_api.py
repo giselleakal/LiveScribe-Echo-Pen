@@ -159,6 +159,19 @@ class ServeApiTest(unittest.TestCase):
         self.assertEqual(status, 500)
         reconcile.assert_called_once()
 
+    def test_unexpected_handler_error_is_a_logged_500(self):
+        os.makedirs(os.path.join(serve.OUT, "pages", "1.2.3.4"))
+        with mock.patch.object(serve, "delete_page",
+                               side_effect=OSError("disk full")), \
+                mock.patch.object(serve, "_reconcile"):
+            status, body = self.request("POST", "/api/delete/page",
+                                        {"id": "1.2.3.4"})
+        self.assertEqual(status, 500)
+        self.assertIn("disk full", body["error"])
+        failed = [r for r in serve.telemetry.read_records()
+                  if r.get("event") == "api.crashed"]
+        self.assertEqual(failed[-1]["exc_type"], "OSError")
+
     def test_push_failure_reason_reaches_the_ui(self):
         write_index([{"id": "1.2.3.4"}])
         with mock.patch.dict(os.environ, {"ECHO_SCRIBE_SECRET": "s"}), \

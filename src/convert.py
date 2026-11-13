@@ -25,6 +25,7 @@ import datetime
 import fcntl
 import glob
 import json
+import logging
 import math
 import os
 import re
@@ -424,7 +425,7 @@ def group_lines(strokes, oversize_ratio=None):
         info.append((stroke, y0, y1, (y0 + y1) / 2.0, y1 - y0))
     heights = sorted(i[4] for i in info)
     median_h = heights[len(heights) // 2] or 1.0
-    ceiling = oversize_ratio * median_h if oversize_ratio else float("inf")
+    ceiling = oversize_ceiling(strokes, oversize_ratio)
     tall = [i for i in info if 0.35 * median_h <= i[4] <= ceiling] or info
 
     clusters = []
@@ -449,19 +450,45 @@ def group_lines(strokes, oversize_ratio=None):
     return [ln for ln in ordered if ln]
 
 
-def split_wide_line(strokes, max_aspect):
+def oversize_ceiling(strokes, ratio):
+    """Height above which a stroke counts as oversize on this page.
+
+    ``ratio`` times the median stroke height; infinite when ``ratio`` is
+    None (no stroke is oversize).
+    """
+    if not ratio or not strokes:
+        return float("inf")
+    heights = sorted(stroke_bounds(s)[3] - stroke_bounds(s)[1]
+                     for s in strokes)
+    return ratio * (heights[len(heights) // 2] or 1.0)
+
+
+def line_frame(strokes, ceiling):
+    """The strokes that define a line's extent: all but the oversize ones.
+
+    A margin line or a bracket assigned to a text line must not stretch
+    that line's image or its height.
+    """
+    frame = [s for s in strokes
+             if stroke_bounds(s)[3] - stroke_bounds(s)[1] <= ceiling]
+    return frame or strokes
+
+
+def split_wide_line(strokes, max_aspect, ceiling=float("inf")):
     """Split one line into chunks no wider than ``max_aspect`` × its height.
 
     TrOCR squeezes every image into a 384×384 square, so a very long line
     loses most of its horizontal detail. Cuts go at the widest gaps
     between strokes (word spaces), never through a stroke; a line with no
-    gaps, or a short one, is returned whole.
+    gaps, or a short one, is returned whole. The height ignores strokes
+    taller than ``ceiling``.
     """
     if not max_aspect or len(strokes) < 2:
         return [strokes]
     bounds = [stroke_bounds(s) for s in strokes]
+    frame = [stroke_bounds(s) for s in line_frame(strokes, ceiling)]
     width = max(b[2] for b in bounds) - min(b[0] for b in bounds)
-    height = max(b[3] for b in bounds) - min(b[1] for b in bounds)
+    height = max(b[3] for b in frame) - min(b[1] for b in frame)
     pieces = math.ceil(width / max(1.0, height) / max_aspect)
     if pieces < 2:
         return [strokes]
@@ -483,8 +510,10 @@ def split_wide_line(strokes, max_aspect):
 
 
 def render_line_png(strokes, png_path, width=2400, max_height=1200,
-                    padding=60):
-    pts = [p for s in strokes for p in s]
+                    padding=60, frame=None):
+    """Render one text line for TrOCR, cropped to ``frame`` (default: all
+    strokes); ink outside the crop is clipped."""
+    pts = [p for s in (frame or strokes) for p in s]
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
     bounds = (min(xs) - padding, min(ys) - padding,
@@ -673,15 +702,17 @@ def ocr_page(strokes, page_dir, job):
         return OcrResult(clean_ocr_text(text), ["ocr.png"], True)
     texts, kept = [], []
     lines = group_lines(strokes, oversize_ratio=prof.oversize_ratio)
+    ceiling = oversize_ceiling(strokes, prof.oversize_ratio)
     failures = 0
     for i, line in enumerate(lines):
-        chunks = split_wide_line(line, prof.max_line_aspect)
+        chunks = split_wide_line(line, prof.max_line_aspect, ceiling)
         words = []
         for j, chunk in enumerate(chunks):
             name = ("ocr-line-%d.png" % i if len(chunks) == 1
                     else "ocr-line-%d-%d.png" % (i, j))
             line_png = os.path.join(page_dir, name)
-            render_line_png(chunk, line_png)
+            render_line_png(chunk, line_png,
+                            frame=line_frame(chunk, ceiling))
             kept.append(name)
             try:
                 words.append(ocr.trocr_image_to_text(line_png, prof))
@@ -921,9 +952,14 @@ def main(argv=None):
     try:
         convert_library(args, ocr_job, do_stt)
     except BaseException as e:
-        log.error("convert.failed", exc_info=True, extra={
-            "duration_ms": round((telemetry.monotonic() - started) * 1000, 1),
-            "interrupted": isinstance(e, KeyboardInterrupt)})
+        interrupted = isinstance(e, KeyboardInterrupt)
+        # Ctrl-C is a choice, not a fault: WARNING, so ERROR keeps meaning
+        # that a human must act
+        log.log(logging.WARNING if interrupted else logging.ERROR,
+                "convert.failed", exc_info=not interrupted, extra={
+                    "duration_ms": round(
+                        (telemetry.monotonic() - started) * 1000, 1),
+                    "interrupted": interrupted})
         raise
     finally:
         if took_lock:

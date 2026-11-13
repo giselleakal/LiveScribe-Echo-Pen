@@ -91,7 +91,8 @@ def load_manifest(path):
     if not isinstance(samples, list):
         raise ValueError(f'{path}: expected {{"samples": [...]}}')
     for i, sample in enumerate(samples):
-        if not isinstance(sample, dict) or "truth" not in sample or \
+        if not isinstance(sample, dict) or \
+                not isinstance(sample.get("truth"), str) or \
                 ("page" in sample) == ("image" in sample):
             raise ValueError(f'{path}: sample {i} needs "truth" and exactly '
                              'one of "page" or "image"')

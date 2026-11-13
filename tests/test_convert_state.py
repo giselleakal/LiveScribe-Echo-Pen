@@ -186,6 +186,10 @@ class OcrBookkeepingTest(unittest.TestCase):
         self.interrupt_on = PAGE_B
         with self.assertRaises(KeyboardInterrupt):
             run_main("--ocr")
+        [failed] = [r for r in convert.telemetry.read_records()
+                    if r.get("event") == "convert.failed"]
+        self.assertEqual((failed["level"], failed["interrupted"]),
+                         ("WARNING", True))
         self.interrupt_on = None
         self.calls = 0
         run_main("--ocr")

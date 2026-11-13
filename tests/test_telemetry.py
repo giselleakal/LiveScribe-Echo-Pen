@@ -70,6 +70,14 @@ class RecordShapeTest(unittest.TestCase):
         self.assertEqual(rec["headers"]["Authorization"], "[redacted]")
         self.assertNotIn("hunter22", json.dumps(rec))
 
+    def test_fields_cannot_overwrite_the_correlation_ids(self):
+        with telemetry.bound_request("serve-req"):
+            self.log.info("io", extra={"request_id": "other",
+                                       "run_id": "other"})
+        rec = last("io")
+        self.assertEqual((rec["request_id"], rec["run_id"]),
+                         ("serve-req", telemetry.run_id()))
+
     def test_request_id_is_per_thread(self):
         seen = {}
 
@@ -138,6 +146,17 @@ class CliTest(unittest.TestCase):
         [rec] = [json.loads(line) for line in out]
         self.assertEqual((rec["event"], rec["status"], rec["run_id"]),
                          ("pen.download", 3, "cli-run"))
+
+    def test_level_flag_before_fields_as_run_writes_it(self):
+        proc = self.cli("event", "run", "io", "--level", "WARNING",
+                        "target=dumpscribe", "status=3")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rec = last("io")
+        self.assertEqual((rec["level"], rec["status"]), ("WARNING", 3))
+
+    def test_record_count_must_be_positive(self):
+        self.cli("event", "run", "x")
+        self.assertEqual(self.cli("logs", "-n", "0").returncode, 2)
 
     def test_empty_log_says_so(self):
         proc = self.cli("logs")

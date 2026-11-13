@@ -854,20 +854,28 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self._status = None
         started = telemetry.monotonic()
         with telemetry.bound_request(uuid.uuid4().hex[:12]):
-            super().handle_one_request()
-            if not getattr(self, "command", None):
-                return   # connection closed without a request
-            status = self._status or 0
-            level = logging.INFO if self.command == "POST" else logging.DEBUG
-            if status >= 500:
-                level = logging.WARNING
-            log.log(level, "http.request", extra={
-                "method": self.command,
-                "path": urllib.parse.urlsplit(self.path).path,
-                "status": status,
-                "client": self.client_address[0],
-                "duration_ms": round(
-                    (telemetry.monotonic() - started) * 1000, 1)})
+            try:
+                super().handle_one_request()
+            except Exception:
+                self._status = self._status or 500
+                raise
+            finally:
+                self._log_request(started)
+
+    def _log_request(self, started):
+        """The one http.request record of the request being finished."""
+        if not getattr(self, "command", None):
+            return   # connection closed without a request
+        status = self._status or 0
+        level = logging.INFO if self.command == "POST" else logging.DEBUG
+        if status >= 500:
+            level = logging.WARNING
+        log.log(level, "http.request", extra={
+            "method": self.command,
+            "path": urllib.parse.urlsplit(self.path).path,
+            "status": status,
+            "client": self.client_address[0],
+            "duration_ms": round((telemetry.monotonic() - started) * 1000, 1)})
 
     # -- request guards ----------------------------------------------------
 
@@ -962,6 +970,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     "api.refused", extra={"path": self.path,
                                           "status": e.status,
                                           "reason": e.message})
+        except Exception as e:
+            log.error("api.crashed", exc_info=True, extra={"path": self.path})
+            status = 500
+            payload = {"ok": False,
+                       "error": "internal error: %s: %s" % (type(e).__name__,
+                                                            e)}
         send_json(self, status, payload)
 
     def _route(self):

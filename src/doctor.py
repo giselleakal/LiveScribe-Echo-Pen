@@ -13,10 +13,12 @@ content (page text, transcripts, titles), and the home directory is
 written as ``~``.
 """
 import dataclasses
+import getpass
 import glob
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -236,10 +238,29 @@ def print_checklist(results):
 # debug report
 # ---------------------------------------------------------------------------
 
+WINDOWS_USER_DIR = re.compile(r"((?:/mnt/[a-z]|[A-Za-z]:)[\\/]+Users[\\/]+)"
+                              r"[^\\/\s\"']+", re.IGNORECASE)
+
+
 def scrub(text):
-    """Write the home directory as ~ so a shared report names no user."""
+    """Hide who ran this, so a shared report names no user.
+
+    The home directory becomes ~, Windows user folders (C:\\Users\\<name>,
+    /mnt/c/Users/<name>) become <user>, and so does the login name itself
+    wherever it appears as a whole word.
+    """
     home = os.path.expanduser("~")
-    return text.replace(home, "~") if home and home != "/" else text
+    if home and home != "/":
+        text = text.replace(home, "~")
+    text = WINDOWS_USER_DIR.sub(r"\1<user>", text)
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = ""
+    if len(user) >= 3:
+        text = re.sub(r"(?<![\w.-])%s(?![\w.-])" % re.escape(user), "<user>",
+                      text)
+    return text
 
 
 def git_summary():
