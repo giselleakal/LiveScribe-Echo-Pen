@@ -25,6 +25,7 @@ import datetime
 import fcntl
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -366,7 +367,7 @@ def render_png(strokes, png_path, width=320, grid=True, bounds=None):
         # dot grid
         ctx.set_source_rgb(0.79, 0.83, 0.91)
         for gx, gy, r in dot_grid(bounds):
-            ctx.arc(gx, gy, r, 0, 2 * 3.14159)
+            ctx.arc(gx, gy, r, 0, math.tau)
             ctx.fill()
     # ink
     ctx.set_source_rgb(*[c / 255.0 for c in INK])
@@ -404,7 +405,7 @@ def group_lines(strokes):
         return []
     info = []
     for stroke in strokes:
-        x0, y0, x1, y1 = stroke_bounds(stroke)
+        _, y0, _, y1 = stroke_bounds(stroke)
         info.append((stroke, y0, y1, (y0 + y1) / 2.0, y1 - y0))
     heights = sorted(i[4] for i in info)
     median_h = heights[len(heights) // 2] or 1.0
@@ -1038,6 +1039,8 @@ def convert_sessions(lib):
             s["urls"] = copy_session_audio(lib, s)
         lib.state["sources"].update(sigs)
         lib.state["session_entries"][s["id"]] = session_entry(s, prev)
+        if isinstance(prev, dict) and prev.get("transcript") is not None:
+            s["transcript"] = prev["transcript"]
         kept_audio.update(os.path.basename(u) for u in s["urls"])
     return sessions, kept_audio, skipped
 
@@ -1100,7 +1103,7 @@ def copy_session_audio(lib, s):
 
 
 def session_entry(s, prev):
-    """State entry for a session; carries transcripts from ``prev``."""
+    """State entry for a session; carries STT results over from ``prev``."""
     entry = {"urls": s["urls"], "pages": s["pages"], "notebook": s["notebook"]}
     for k in ("captured", "captured_end", "pen_tstart", "pen_tend"):
         if s.get(k) is not None:
@@ -1110,8 +1113,6 @@ def session_entry(s, prev):
     for k in SESSION_CARRY_KEYS:
         if prev.get(k) is not None:
             entry[k] = prev[k]
-    if prev.get("transcript") is not None:
-        s["transcript"] = prev["transcript"]
     return entry
 
 
