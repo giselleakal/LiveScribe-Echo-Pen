@@ -69,27 +69,37 @@ def _load_model():
 
 
 def _chunks(audio):
-    """Yield ~CHUNK_S windows with a small overlap from a float32 array."""
+    """Yield ~CHUNK_S windows overlapping by STRIDE_S; the last may be short."""
     size = int(SAMPLE_RATE * CHUNK_S)
-    overlap = int(SAMPLE_RATE * STRIDE_S)
-    step = max(1, size - overlap)  # slide past the overlap each window
-    if len(audio) <= size:
-        yield audio
-        return
-    for start in range(0, max(1, len(audio) - size), step):
+    step = max(1, size - int(SAMPLE_RATE * STRIDE_S))
+    start = 0
+    while True:
         yield audio[start:start + size]
-    if (len(audio) - size) % step != 0:
-        yield audio[-size:]
+        if start + size >= len(audio):
+            return
+        start += step
+
+
+MAX_OVERLAP_WORDS = 5   # words the 1 s window overlap can repeat
 
 
 def _stitch(texts):
-    """Concatenate chunk texts, dropping duplicate words at boundaries."""
+    """Join chunk texts, dropping words repeated across a chunk boundary.
+
+    Neighbouring windows share STRIDE_S of audio, so the end of one chunk
+    and the start of the next can transcribe the same few words.
+    """
     words = []
     for text in texts:
-        for w in text.split():
-            if words and words[-1].lower() == w.lower():
-                continue
-            words.append(w)
+        new = text.split()
+        limit = min(MAX_OVERLAP_WORDS, len(words), len(new))
+        overlap = 0
+        for k in range(limit, 0, -1):
+            tail = [w.lower() for w in words[-k:]]
+            if tail == [w.lower() for w in new[:k]]:
+                overlap = k
+                break
+        words.extend(new[overlap:])
     return " ".join(words)
 
 

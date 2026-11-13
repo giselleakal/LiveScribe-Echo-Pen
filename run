@@ -17,7 +17,8 @@
 #                        re-send unchanged notes, --flush-only to drain the
 #                        queue. Requires ECHO_SCRIBE_SECRET to be set.
 #   ./run clean-pen     download the notebook, then delete it from the pen
-#                        (bulk, destructive; prompts for confirmation)
+#                        (bulk, destructive; prompts for confirmation;
+#                        deletes only when pages AND audio downloaded)
 #   ./run help          this message
 #
 # The pen only appears inside WSL after scripts/windows-connect.ps1 has
@@ -43,7 +44,7 @@ else
 fi
 
 usage() {
-    sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 convert_only() {
@@ -59,86 +60,120 @@ serve() {
     exec "$PYTHON" "$ROOT/src/serve.py" "$@"
 }
 
-presetup() {
-    # 1. Confirm the pen is attached, with the exact Livescribe IDs.
-    if ! lsusb 2>/dev/null | grep -Eqi '1cfb:103[0-2]'; then
-        echo "ERROR: Livescribe pen not attached to WSL (expected 1cfb:1030/1031/1032 in lsusb)." >&2
-        echo "Run scripts/windows-connect.ps1 in an ADMIN PowerShell on Windows," >&2
-        echo "then confirm with: lsusb" >&2
-        exit 1
-    fi
+pen_attached() {
+    lsusb 2>/dev/null | grep -Eqi '1cfb:103[0-2]'
+}
 
-    # 2. Build the pen client if it is missing.
-    if [ ! -x "$ROOT/vendor/dumpscribe" ]; then
-        echo "Building dumpscribe..."
-        "$ROOT/scripts/build-dumpscribe.sh"
-    fi
+require_pen() {
+    pen_attached && return 0
+    echo "ERROR: Livescribe pen not attached to WSL (expected 1cfb:1030/1031/1032 in lsusb)." >&2
+    echo "Run scripts/windows-connect.ps1 in an ADMIN PowerShell on Windows," >&2
+    echo "then confirm with: lsusb" >&2
+    exit 1
+}
 
-    # 3. Download from the pen (needs root for raw USB access) and hand
-    #    the dump back to this user.
+# Build the pen client when it is missing or older than its source, so a
+# pulled fix to dumpscribe.c is never silently skipped.
+ensure_dumpscribe() {
+    local bin="$ROOT/vendor/dumpscribe"
+    if [ -x "$bin" ] && [ "$bin" -nt "$ROOT/vendor/dumpscribe.c" ]; then
+        return 0
+    fi
+    echo "Building dumpscribe..."
+    "$ROOT/scripts/build-dumpscribe.sh"
+}
+
+# Hand data/ back to this user; runs after every sudo call, failed or not,
+# so a half-finished download never leaves root-owned files behind.
+own_data() {
+    if [ -d "$ROOT/data" ]; then
+        sudo chown -R "$(id -u):$(id -g)" "$ROOT/data" || true
+    fi
+}
+
+# Download everything from the pen into data/ (needs root for raw USB).
+# Sets ECHO_AUDIO_OK / ECHO_PAGES_OK from dumpscribe's "[ECHO] ... ok"
+# markers: together they mean the whole pen is backed up locally.
+download_from_pen() {
+    require_pen
+    ensure_dumpscribe
     echo "Syncing pen (runs as root to access the USB device)..."
-    local logfile
+    local logfile status
     logfile="$(mktemp)"
+    set +e
     # shellcheck disable=SC2024
     sudo "$ROOT/vendor/dumpscribe" "$ROOT/data" 2>&1 | tee "$logfile"
-    # The pipeline exit status is dumpscribe's (pipefail), so a hard
-    # failure still stops here; the "audio download ok" marker tells us
-    # whether audio made it (so a later pen-clear offer is safe).
+    status=${PIPESTATUS[0]}
+    set -e
+    own_data
     ECHO_AUDIO_OK=0
-    if grep -q '\[ECHO\] audio download ok' "$logfile"; then
-        ECHO_AUDIO_OK=1
-    fi
+    ECHO_PAGES_OK=0
+    grep -q '\[ECHO\] audio download ok' "$logfile" && ECHO_AUDIO_OK=1
+    grep -q '\[ECHO\] pages download ok' "$logfile" && ECHO_PAGES_OK=1
     rm -f "$logfile"
-    sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
-}
-
-# Offer to clear the pen after a successful, fully-downloaded sync.
-# Only when BOTH pages and audio are safe on disk (ECHO_AUDIO_OK) do we
-# suggest retiring the pen; otherwise a clear could delete pen audio that
-# was never backed up. Retire-only (-r) does NOT re-download: the sync
-# just made a fresh backup, so it wipes the pen and leaves local data
-# exactly as curated (deletions via the web UI stay deleted).
-maybe_offer_clear_pen() {
-    [ "${ECHO_AUDIO_OK:-0}" -eq 1 ] || { echo "Not offering pen clear (audio didn't download — pen left as-is)."; return 0; }
-    while true; do
-        read -r -p "Sync complete. Pen audio + pages are saved locally. Clear them from the pen to free space? [y/N] " ans
-        case "$ans" in
-            y|Y|yes|Yes)
-                echo "Retiring pen (no re-download; local backup already safe). Ctrl+C to abort now..."
-                sudo "$ROOT/vendor/dumpscribe" -r "$ROOT/data"
-                sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
-                echo "Pen cleared."
-                break
-                ;;
-            n|N|no|No|"")
-                echo "Leaving the pen untouched."
-                break
-                ;;
-            *)
-                echo "Please answer y or N."
-                ;;
-        esac
-    done
-}
-
-clean_pen() {
-    if [ ! -x "$ROOT/vendor/dumpscribe" ]; then
-        echo "Building dumpscribe..."
-        "$ROOT/scripts/build-dumpscribe.sh"
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: pen download failed (dumpscribe exit $status); nothing was deleted from the pen." >&2
+        exit "$status"
     fi
-    if ! lsusb 2>/dev/null | grep -Eqi '1cfb:103[0-2]'; then
-        echo "ERROR: Livescribe pen not attached to WSL (expected 1cfb:1030/1031/1032)." >&2
+}
+
+pen_fully_backed_up() {
+    [ "${ECHO_AUDIO_OK:-0}" -eq 1 ] && [ "${ECHO_PAGES_OK:-0}" -eq 1 ]
+}
+
+# Ask a y/N question; anything but yes (including no terminal) is no.
+confirm() {
+    local ans=""
+    read -r -p "$1 [y/N] " ans || ans=""
+    case "$ans" in
+        y|Y|yes|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Wipe every notebook (pages + audio) from the pen, without downloading.
+# Only ever called right after a download that saved everything.
+retire_pen() {
+    echo "Retiring pen (no re-download; local backup already safe)..."
+    set +e
+    sudo "$ROOT/vendor/dumpscribe" -r "$ROOT/data"
+    local status=$?
+    set -e
+    own_data
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: clearing the pen failed (dumpscribe exit $status)." >&2
+        exit "$status"
+    fi
+    echo "Pen cleared."
+}
+
+# Offer to clear the pen after a sync, only when BOTH pages and audio are
+# safe on disk; otherwise a clear could delete notes that were never
+# backed up. Local data stays exactly as curated (web UI deletions stay).
+maybe_offer_clear_pen() {
+    if ! pen_fully_backed_up; then
+        echo "Not offering to clear the pen (not everything downloaded; pen left as-is)."
+        return 0
+    fi
+    if confirm "Sync complete. Pen audio + pages are saved locally. Clear them from the pen to free space?"; then
+        retire_pen
+    else
+        echo "Leaving the pen untouched."
+    fi
+}
+
+# Download everything, then delete it from the pen; refuses to delete
+# unless the download saved both pages and audio.
+clean_pen() {
+    require_pen
+    confirm "Download the notebook, then DELETE it from the pen?" || { echo "Aborted."; exit 1; }
+    download_from_pen
+    convert_only
+    if ! pen_fully_backed_up; then
+        echo "ERROR: not everything downloaded; refusing to delete anything from the pen." >&2
         exit 1
     fi
-    read -r -p "Download the notebook, then DELETE it from the pen? [y/N] " ans
-    case "$ans" in
-        y|Y|yes|Yes) ;;
-        *) echo "Aborted."; exit 1 ;;
-    esac
-    echo "Downloading from pen and deleting from pen (runs as root)..."
-    sudo "$ROOT/vendor/dumpscribe" -c "$ROOT/data"
-    sudo chown -R "$(id -u):$(id -g)" "$ROOT/data"
-    convert_only
+    retire_pen
 }
 
 mode="${1:-}"
@@ -172,7 +207,7 @@ case "$mode" in
         ;;
     sync)
         shift
-        presetup
+        download_from_pen
         convert_only
         maybe_offer_clear_pen
         # optional passthrough: ./run sync serve --port 9000

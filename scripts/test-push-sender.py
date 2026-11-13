@@ -4,6 +4,9 @@
 Exercises: signing vector, small-note round trip, dedup, ~3 MB chunked
 round trip with sha256 verification, and off-line durability (queue drains
 once the receiver is reachable).
+
+Runs against a throwaway ECHO_ROOT holding one synthetic page, so the real
+library, push state and queue are never touched.
 """
 import base64
 import glob
@@ -12,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -20,23 +24,28 @@ SRC = os.path.join(ROOT, "src")
 sys.path.insert(0, SRC)
 
 SECRET = "test-echo-scribe-secret"
-ROOT_DIR = os.path.join(ROOT, "test-inbox")
+SANDBOX = tempfile.mkdtemp(prefix="echo-push-test-")
+ROOT_DIR = os.path.join(SANDBOX, "test-inbox")
+PAGE_ID = "1.2.3.4"
 PORT = 18231
 URL = "http://127.0.0.1:%d/webhooks/echo-scribe" % PORT
 DEAD_URL = "http://127.0.0.1:39999/webhooks/echo-scribe"  # nothing listening
 
-# env must be set before importing scribe (URL_DEFAULT + secret are read at use)
+# a one-page library in the sandbox
+os.makedirs(os.path.join(SANDBOX, "output", "pages", PAGE_ID))
+with open(os.path.join(SANDBOX, "output", "pages", PAGE_ID, "page.svg"),
+          "w") as f:
+    f.write('<svg xmlns="http://www.w3.org/2000/svg"/>')
+with open(os.path.join(SANDBOX, "output", "index.json"), "w") as f:
+    json.dump({"pages": [{"id": PAGE_ID, "text": "hello",
+                          "svg": "pages/%s/page.svg" % PAGE_ID}],
+               "sessions": []}, f)
+
+# env must be set before importing scribe (paths, URL and secret)
+os.environ["ECHO_ROOT"] = SANDBOX
 os.environ["ECHO_SCRIBE_SECRET"] = SECRET
 os.environ["ECHO_SCRIBE_URL"] = URL
 import scribe  # noqa: E402
-
-# start from a clean slate (clear prior dedup state + queue + inbox)
-import shutil
-for p in (scribe.STATE_PATH,):
-    if os.path.exists(p):
-        os.remove(p)
-shutil.rmtree(scribe.QUEUE_DIR, ignore_errors=True)
-shutil.rmtree(ROOT_DIR, ignore_errors=True)
 
 
 def run(cmd):
@@ -73,10 +82,10 @@ try:
 
     # 2. small page note round trip (contract test #2)
     banner("small page note -> Hermes")
-    results, summary = scribe.push_targets([("page", "2193.1.47.79")])
+    results, summary = scribe.push_targets([("page", PAGE_ID)])
     print("summary:", summary)
     print("results:", results)
-    pid = "2193.1.47.79"
+    pid = PAGE_ID
     needle = os.path.join(ROOT_DIR, "*", pid)
     dirs = glob.glob(needle)
     assert dirs, "no page dir created"
@@ -158,3 +167,5 @@ try:
 finally:
     recv.terminate()
     recv.wait()
+    import shutil
+    shutil.rmtree(SANDBOX, ignore_errors=True)
