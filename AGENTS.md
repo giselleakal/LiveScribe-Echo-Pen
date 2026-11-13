@@ -15,8 +15,9 @@ a PR description:
 
 - pen data or anything derived from it: `.stf` pages, page SVG/PNG, audio,
   OCR text, transcripts, screenshots or photos of the notebook
-- handwriting samples and OCR ground truth: they go in the gitignored
-  `training/private/`, never in `training/` itself
+- handwriting samples, OCR ground truth and the OCR vocabulary file
+  (`vocabulary.txt`): they go in the gitignored `training/private/`, never
+  in `training/` itself
 - what a note says, even quoted as an example or a test string; tests
   use synthetic strokes from `tests/fixtures.py`
 - names, phone numbers, emails, addresses, employer or customer details
@@ -160,8 +161,10 @@ history needs the repository owner and a force-push.
 - After editing `run` or `scripts/*.sh`, run `bash -n run`, and also
   `shellcheck run` if it is installed (`uvx --from shellcheck-py shellcheck run`
   works without installing).
-- OCR changes: add a profile or knob in `src/ocr.py` instead of changing
-  `legacy`, and compare with `./run ocr-eval --profile ...` on real samples.
+- OCR changes: add a `Profile` setting in `src/ocr.py` (never change
+  `legacy` or `beam`), and compare one setting at a time with
+  `./run ocr-eval --set key=value` on the dev split. Check the test split
+  once, at the end, and don't tune thresholds to the samples.
 - `vendor/dumpscribe.c` cannot be built without openobex; at least
   syntax-check edits, and say so when the real build was not run.
 

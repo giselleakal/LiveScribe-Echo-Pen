@@ -158,24 +158,24 @@ class TemporalLinesTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class ChooseTest(unittest.TestCase):
-    WORDS = frozenset({"phones", "are", "attached", "to"})
+    WORDS = frozenset({"brown", "fox", "jumps", "to"})
 
     def test_highest_score_wins_without_a_prior(self):
-        cands = [ocr.Candidate("hones are", -0.2),
-                 ocr.Candidate("phones are", -0.3)]
-        self.assertEqual(ocr.choose(cands, 0.0, self.WORDS), "hones are")
+        cands = [ocr.Candidate("brawn fox", -0.2),
+                 ocr.Candidate("brown fox", -0.3)]
+        self.assertEqual(ocr.choose(cands, 0.0, self.WORDS), "brawn fox")
 
     def test_near_tie_prefers_known_words(self):
-        cands = [ocr.Candidate("hones are attached", -0.20),
-                 ocr.Candidate("phones are attached", -0.28)]
+        cands = [ocr.Candidate("brawn fox jumps", -0.20),
+                 ocr.Candidate("brown fox jumps", -0.28)]
         self.assertEqual(ocr.choose(cands, 0.15, self.WORDS),
-                         "phones are attached")
+                         "brown fox jumps")
 
     def test_prior_never_overrules_a_clear_winner(self):
-        cands = [ocr.Candidate("hones are attached", -0.10),
-                 ocr.Candidate("phones are attached", -0.90)]
+        cands = [ocr.Candidate("brawn fox jumps", -0.10),
+                 ocr.Candidate("brown fox jumps", -0.90)]
         self.assertEqual(ocr.choose(cands, 0.15, self.WORDS),
-                         "hones are attached")
+                         "brawn fox jumps")
 
     def test_digits_are_not_unknown_words(self):
         cands = [ocr.Candidate("(5)", -0.20), ocr.Candidate("to", -0.25)]

@@ -635,7 +635,9 @@ def render_line_normalized(strokes, png_path, frame, pen_width):
     whatever the pen pressure, and the same margin on every line.
 
     ``frame`` (the letter-sized strokes) sets the crop and the letter
-    height; ``pen_width`` is a fraction of the letter height.
+    height; ``pen_width`` is a fraction of the letter height. A line
+    wider than MAX_LINE_PX is scaled down to fit, which only happens
+    when line splitting is off.
     """
     letter = median_height(frame)
     pad = PAD_LETTERS * letter

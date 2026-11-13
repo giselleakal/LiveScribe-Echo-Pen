@@ -157,7 +157,7 @@ def trocr_available():
     try:
         import torch  # noqa: F401 # pyright: ignore[reportMissingImports]
         import transformers  # noqa: F401 # pyright: ignore[reportMissingImports]
-        from PIL import Image  # noqa: F401
+        from PIL import Image  # noqa: F401 # pyright: ignore[reportMissingImports]
     except Exception:
         return False
     return True
@@ -210,13 +210,17 @@ def recognize(image_paths, prof):
 
 
 def _open_rgb(path):
-    from PIL import Image
+    from PIL import Image  # pyright: ignore[reportMissingImports]
     return Image.open(path).convert("RGB")
 
 
 def trocr_candidates(image_paths, prof):
-    """Readings of every image: the top one each, or the n-best when a
-    vocabulary prior will choose among them."""
+    """Scored readings of a line's images: the top one per image, or the
+    n-best per image when a vocabulary prior will choose among them.
+
+    Only beam search scores its readings, so with ``beams < 2`` (or one
+    image and no prior) just the first image is read, unscored.
+    """
     torch, processor, model = _load_trocr()
     images = [_open_rgb(p) for p in image_paths]
     kwargs = generate_kwargs(prof)
@@ -247,7 +251,7 @@ def _scored_readings(torch, processor, model, images, kwargs):
                              return_dict_in_generate=True, **kwargs)
     texts = processor.batch_decode(out.sequences, skip_special_tokens=True)
     return [Candidate(t.strip(), float(score))
-            for t, score in zip(texts, out.sequences_scores)]
+            for t, score in zip(texts, out.sequences_scores, strict=True)]
 
 
 _warned_unscored = []
