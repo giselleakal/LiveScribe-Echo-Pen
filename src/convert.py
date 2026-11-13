@@ -20,8 +20,9 @@ Usage:  ./src/convert.py [--ocr] [--ocr-engine auto|tesseract|trocr] [--force]
                      [--stt] [--session <id>]
 """
 import argparse
-import atexit
+import dataclasses
 import datetime
+import fcntl
 import glob
 import json
 import os
@@ -29,6 +30,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 
 import paths
@@ -54,6 +56,7 @@ NOTEBOOK_NAMES_PATH = os.path.join(ROOT, "notebook_names.json")
 # ids and page ids never collide, so one file serves both)
 TITLES_PATH = os.path.join(ROOT, "titles.json")
 LOCK_PATH = os.path.join(ROOT, ".convert.lock")
+_held = threading.local()   # the calling thread's lock fd, if it holds one
 
 
 # ---------------------------------------------------------------------------
@@ -61,38 +64,74 @@ LOCK_PATH = os.path.join(ROOT, ".convert.lock")
 # ---------------------------------------------------------------------------
 
 def acquire_lock(wait=3.0):
-    """Create the convert lock file exclusively (O_CREAT | O_EXCL).
+    """Take the run lock: an exclusive flock on ``.convert.lock``.
 
-    Returns True if this process took the lock. Returns False without
-    creating anything when ``ECHO_LOCK_HELD`` is set: serve.py sets that
-    before launching a reconcile ``convert`` while it already holds the
-    lock, so the child skips locking and can't deadlock against its parent.
+    Returns True if this thread took the lock. Returns False without
+    locking when ``ECHO_LOCK_HELD`` is set: serve.py sets that before
+    launching a reconcile ``convert`` while it already holds the lock, so
+    the child can't deadlock against its parent.
+
+    The kernel drops the lock when its holder exits, however it dies, so a
+    killed convert or server never leaves a stale lock behind. The file
+    itself stays; it records the holder's pid for diagnostics only.
 
     Blocks/retries up to ``wait`` seconds; raises RuntimeError if the
     lock stays held that long.
     """
     if os.environ.get("ECHO_LOCK_HELD"):
         return False
-    deadline = time.time() + wait
+    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    deadline = time.monotonic() + wait
     while True:
         try:
-            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode("ascii"))
-            os.close(fd)
-            return True
-        except FileExistsError:
-            if time.time() >= deadline:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
                 raise RuntimeError(
-                    "Another convert is running (lock file: %s). "
-                    "Try again shortly." % LOCK_PATH)
+                    "Another convert is running (lock file: %s, pid %s). "
+                    "Try again shortly." % (LOCK_PATH, lock_owner()))
             time.sleep(0.1)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode("ascii"))
+    _held.fd = fd
+    return True
 
 
 def release_lock():
+    fd = getattr(_held, "fd", None)
+    if fd is None:
+        return
+    _held.fd = None
     try:
-        os.remove(LOCK_PATH)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def lock_owner():
+    """Pid recorded by the last lock holder, or None when unknown."""
+    try:
+        with open(LOCK_PATH) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def lock_is_held():
+    """True when some process currently holds the run lock."""
+    try:
+        fd = os.open(LOCK_PATH, os.O_RDONLY)
     except OSError:
-        pass
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -164,10 +203,18 @@ class StrokeCollector(parsestf.STFParser):
 
 
 def load_strokes(stf_path):
-    """Parse a .stf into (strokes, tmin, tmax) with pen-time ms bounds."""
+    """Parse a .stf into (strokes, tmin, tmax) with pen-time ms bounds.
+
+    A file cut off mid-stroke (pen unplugged during sync) keeps every
+    complete stroke; only the unfinished one is dropped.
+    """
     with open(stf_path, "rb") as f:
         sc = StrokeCollector(f)
-        sc.parse()
+        try:
+            sc.parse()
+        except EOFError:
+            print("warning: %s is truncated; keeping %d complete strokes"
+                  % (stf_path, len(sc.strokes)), file=sys.stderr)
     return [s for s in sc.strokes if s], sc.tmin, sc.tmax
 
 
@@ -269,6 +316,11 @@ def ink_bounds(strokes, padding=PAGE_PADDING, min_canvas=MIN_CANVAS):
     return (minx, miny, maxx, maxy)
 
 
+def stroke_width(avg_force):
+    """Rendered line width (STF units) for a stroke's mean pen force."""
+    return max(1.5, (max(avg_force, 0) ** 0.3) * 3)
+
+
 def render_svg(strokes, path, bounds=None):
     if bounds is None:
         bounds = ink_bounds(strokes)
@@ -288,7 +340,7 @@ def render_svg(strokes, path, bounds=None):
                  'stroke-linejoin="round">\n' % INK)
     for stroke in strokes:
         avg_f = sum(p[2] for p in stroke) / len(stroke)
-        width = max(1.5, (avg_f ** 0.3) * 3)
+        width = stroke_width(avg_f)
         d = "M" + " L".join("%.1f %.1f" % (x, y) for x, y, _ in stroke)
         parts.append('<path d="%s" stroke-width="%.2f"/>\n' % (d, width))
     parts.append('</g>\n</svg>\n')
@@ -322,7 +374,7 @@ def render_png(strokes, png_path, width=320, grid=True, bounds=None):
     ctx.set_line_join(cairo.LINE_JOIN_ROUND)
     for stroke in strokes:
         avg_f = sum(p[2] for p in stroke) / len(stroke)
-        ctx.set_line_width(max(1.5, (avg_f ** 0.3) * 3))
+        ctx.set_line_width(stroke_width(avg_f))
         ctx.move_to(stroke[0][0], stroke[0][1])
         for x, y, _ in stroke[1:]:
             ctx.line_to(x, y)
@@ -523,32 +575,132 @@ def collect_sessions(data_dir):
 # OCR
 # ---------------------------------------------------------------------------
 
-def ocr_page(strokes, page_dir, engine, lang, psm):
+@dataclasses.dataclass(frozen=True)
+class OcrJob:
+    """Which recognizer runs, with which options; part of the reuse key."""
+    engine: str
+    lang: str
+    psm: int
+
+    def settings(self):
+        return [self.engine, self.lang, self.psm]
+
+
+@dataclasses.dataclass(frozen=True)
+class PageInk:
+    page_id: str
+    strokes: list
+    page_dir: str
+
+
+@dataclasses.dataclass(frozen=True)
+class OcrResult:
+    """Recognized text, the ocr*.png files it came from, and whether every
+    line was read (False when some lines failed and should be retried)."""
+    text: str
+    kept: list
+    complete: bool
+
+
+OCR_ENTRY_KEYS = ("text", "ocr", "ocr_engine", "ocr_settings")
+
+
+def ocr_page(strokes, page_dir, job):
     """OCR one page with the selected backend.
 
-    Returns (text, kept_pngs) where kept_pngs lists the ocr*.png filenames
-    that are still part of the result. Files are published atomically; the
-    caller prunes any older ocr*.png that are no longer in the set.
+    Files are published atomically; the caller prunes any older ocr*.png
+    that are not in ``OcrResult.kept``. Raises RuntimeError when the
+    recognizer failed on every line, so a broken model is not mistaken
+    for a blank page.
     """
-    kept = []
-    if engine == "trocr":
-        texts = []
-        for i, line in enumerate(group_lines(strokes)):
-            name = "ocr-line-%d.png" % i
-            line_png = os.path.join(page_dir, name)
-            render_line_png(line, line_png)
-            kept.append(name)
-            try:
-                texts.append(ocr.trocr_image_to_text(line_png))
-            except Exception as e:
-                print("warning: TrOCR failed on line %d: %s" % (i, e),
-                      file=sys.stderr)
-        return clean_ocr_text("\n".join(t for t in texts if t)), kept
-    name = "ocr.png"
-    ocr_png = os.path.join(page_dir, name)
-    render_png(strokes, ocr_png, width=2000, grid=False)
-    kept.append(name)
-    return clean_ocr_text(ocr.image_to_text(ocr_png, lang=lang, psm=psm)), kept
+    if job.engine != "trocr":
+        ocr_png = os.path.join(page_dir, "ocr.png")
+        render_png(strokes, ocr_png, width=2000, grid=False)
+        text = ocr.image_to_text(ocr_png, lang=job.lang, psm=job.psm)
+        return OcrResult(clean_ocr_text(text), ["ocr.png"], True)
+    texts, kept = [], []
+    lines = group_lines(strokes)
+    for i, line in enumerate(lines):
+        name = "ocr-line-%d.png" % i
+        line_png = os.path.join(page_dir, name)
+        render_line_png(line, line_png)
+        kept.append(name)
+        try:
+            texts.append(ocr.trocr_image_to_text(line_png))
+        except Exception as e:
+            print("warning: TrOCR failed on line %d: %s" % (i, e),
+                  file=sys.stderr)
+    failures = len(lines) - len(texts)
+    if lines and failures == len(lines):
+        raise RuntimeError("TrOCR failed on all %d lines" % failures)
+    text = clean_ocr_text("\n".join(t for t in texts if t))
+    return OcrResult(text, kept, failures == 0)
+
+
+def has_transcription(entry):
+    return bool(entry.get("ocr") or entry.get("text"))
+
+
+def page_reusable(prev, source_unchanged, has_svg, job, state):
+    """True when a page's previous render (and OCR, if wanted) still holds."""
+    if prev is None or not source_unchanged or not has_svg:
+        return False
+    if job is None:
+        return True
+    done_with = prev.get("ocr_settings", state.get("ocr_settings"))
+    return bool(prev.get("ocr")) and done_with == job.settings()
+
+
+def carry_ocr(entry, last):
+    """Copy a still-valid transcription from the previous index entry."""
+    for key in OCR_ENTRY_KEYS:
+        if key in last:
+            entry[key] = last[key]
+
+
+def drop_ocr_files(page_dir):
+    """Remove text.txt and ocr*.png left by an outdated transcription."""
+    stale = [os.path.join(page_dir, "text.txt")]
+    stale += glob.glob(os.path.join(page_dir, "ocr*.png"))
+    for path in stale:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def transcribe_page(entry, ink, job, last_good):
+    """OCR ``ink`` into ``entry``.
+
+    ``last_good`` is the previous entry when the ink is unchanged (else
+    empty): if the recognizer itself fails, that transcription is kept
+    rather than replaced by nothing. ``entry["ocr"]`` is True only when
+    every line was read, so a partial result is retried by the next OCR
+    run; a page with no recognizable text counts as done.
+    """
+    try:
+        result = ocr_page(ink.strokes, ink.page_dir, job)
+    except Exception as e:
+        print("warning: OCR failed for %s: %s" % (ink.page_id, e),
+              file=sys.stderr)
+        if has_transcription(last_good):
+            carry_ocr(entry, last_good)
+            return
+        drop_ocr_files(ink.page_dir)
+        entry["ocr"] = False
+        return
+    prune_ocr_pngs(ink.page_dir, result.kept)
+    entry.update({"ocr": result.complete, "ocr_engine": job.engine,
+                  "ocr_settings": job.settings()})
+    text_path = os.path.join(ink.page_dir, "text.txt")
+    if result.text:
+        atomic_write(text_path, result.text + "\n")
+        entry["text"] = result.text
+        return
+    try:
+        os.remove(text_path)
+    except OSError:
+        pass
 
 
 def prune_ocr_pngs(page_dir, kept_names):
@@ -570,19 +722,31 @@ def file_sig(path):
     return {"mtime_ns": int(st.st_mtime_ns), "size": int(st.st_size)}
 
 
-def load_state():
-    state = {
+def empty_state():
+    return {
         "render_version": None,     # RENDER_VERSION of the last render
         "sources": {},          # src relpath -> {"mtime_ns", "size"}
         "page_entries": {},     # page_id -> last index entry written
         "session_entries": {},  # session_id -> {"urls","pages","notebook"}
-        "ocr_settings": None,   # [engine, lang, psm] of last OCR pass
+        "ocr_settings": None,   # OCR settings of pages lacking their own
     }
+
+
+def load_state():
+    state = empty_state()
     try:
         with open(STATE_PATH) as f:
-            return json.load(f)
+            saved = json.load(f)
     except (OSError, ValueError):
         return state
+    if not isinstance(saved, dict):
+        return state
+    for key, value in saved.items():
+        if key in state and isinstance(state[key], dict) and \
+                not isinstance(value, dict):
+            continue
+        state[key] = value
+    return state
 
 
 def save_state(state):
@@ -657,7 +821,9 @@ def main(argv=None):
         else:
             print("OCR engine: %s" % engine)
 
-    settings = [engine, args.ocr_lang, args.ocr_psm] if do_ocr else None
+    ocr_job = None
+    if do_ocr and engine:
+        ocr_job = OcrJob(engine, args.ocr_lang, args.ocr_psm)
 
     do_stt = args.stt
     if do_stt and not stt.available():
@@ -666,311 +832,403 @@ def main(argv=None):
               file=sys.stderr)
         do_stt = False
 
-    if acquire_lock():
-        # released on process exit, so an early exception can't leak it
-        atexit.register(release_lock)
+    took_lock = acquire_lock()
+    try:
+        convert_library(args, ocr_job, do_stt)
+    finally:
+        if took_lock:
+            release_lock()
 
-    data_dir = paths.DATA
-    out_dir = paths.OUT
-    pages_out = os.path.join(out_dir, "pages")
-    audio_out = os.path.join(out_dir, "audio")
-    os.makedirs(pages_out, exist_ok=True)
-    os.makedirs(audio_out, exist_ok=True)
 
+@dataclasses.dataclass
+class Library:
+    """One convert run: options, incremental state and output locations."""
+    args: argparse.Namespace
+    ocr_job: "OcrJob | None"
+    do_stt: bool
+    state: dict
+    # source signatures recorded by the previous run, kept even when
+    # --force or a renderer upgrade discards them from ``state``: they tell
+    # whether a re-rendered page still has the same ink
+    last_sources: dict
+    titles: dict
+    offset: "int | None"
+    data_dir: str = paths.DATA
+    out_dir: str = paths.OUT
+
+    @property
+    def pages_out(self):
+        return os.path.join(self.out_dir, "pages")
+
+    @property
+    def audio_out(self):
+        return os.path.join(self.out_dir, "audio")
+
+
+def open_library(args, ocr_job, do_stt):
     state = load_state()
+    last_sources = dict(state["sources"])
     if args.force:
-        state = {"render_version": None, "sources": {}, "page_entries": {},
-                 "session_entries": {},
-                 "ocr_settings": None}
+        # re-render and re-copy everything, but keep the per-asset entries:
+        # transcriptions, transcripts and frozen capture stamps stay valid
+        state["sources"] = {}
     elif state.get("render_version") != RENDER_VERSION:
-        # Renderer changed (e.g. ink-bounds clipping): ignore the sources
-        # signature cache so every page is re-rendered once, then go back to
-        # incremental. Keep page_entries (rect/svg/thumb paths are stable).
-        # v4: seeds pen_tmin/pen_tmax capture bounds into page_entries so
-        # capture stamps can be frozen against future offset changes.
         print("renderer changed (v%s -> v%s); re-rendering all pages"
               % (state.get("render_version"), RENDER_VERSION))
         state["sources"] = {}
+    # pages not re-rendered yet have no source signature, so recording the
+    # version now is safe even if this run is interrupted
+    state["render_version"] = RENDER_VERSION
+    lib = Library(args=args, ocr_job=ocr_job, do_stt=do_stt, state=state,
+                  last_sources=last_sources, titles=load_titles(),
+                  offset=pen_offset_ms(paths.DATA))
+    os.makedirs(lib.pages_out, exist_ok=True)
+    os.makedirs(lib.audio_out, exist_ok=True)
+    return lib
 
+
+def convert_library(args, ocr_job, do_stt):
+    """Render, transcribe and index everything under data/ (lock held)."""
+    lib = open_library(args, ocr_job, do_stt)
+    pages, skipped_pages = convert_pages(lib)
+    sessions, kept_audio, skipped_sessions = convert_sessions(lib)
+    link_sessions(sessions, {p["id"] for p in pages})
+    prune_outputs(lib, {p["id"] for p in pages}, kept_audio)
+    if lib.do_stt:
+        transcribe_sessions(lib, sessions)
+    write_index(lib, pages, sessions)
+    print("rendered %d pages (%d unchanged, %d sessions (%d unchanged))"
+          % (len(pages), skipped_pages, len(sessions), skipped_sessions))
+
+
+# ---------------------------------------------------------------------------
+# pages
+# ---------------------------------------------------------------------------
+
+def convert_pages(lib):
+    """Render (and optionally OCR) every .stf; returns (entries, skipped)."""
     pages = []
-    skipped_pages = 0
-    offset = pen_offset_ms(data_dir)   # pen-epoch -> real-time conversion
-    titles = load_titles()
-    for stf in sorted(glob.glob(os.path.join(data_dir, "data", "*", "*", "*.stf"))):
-        page_id = os.path.basename(os.path.dirname(os.path.dirname(stf)))
-        src_rel = os.path.relpath(stf, ROOT)
-        sig = file_sig(stf)
-        prev = state.get("page_entries", {}).get(page_id)
-        if args.page is not None and page_id != args.page:
-            # single-page mode (on-demand OCR): reuse other pages so
-            # index.json stays complete without re-touching them.
-            if prev is not None:
-                state["sources"][src_rel] = file_sig(stf)
-                entry = dict(prev)
-                apply_title(entry, page_id, titles)
-                pages.append(entry)
-                skipped_pages += 1
-                print("page %s: unchanged, skipping" % page_id)
-                continue
-            this_ocr = False  # never encoded before; render below, no OCR
-        else:
-            this_ocr = do_ocr
-        reuse = (not args.force) and \
-            state.get("sources", {}).get(src_rel) == sig and prev is not None and \
-            os.path.exists(os.path.join(pages_out, page_id, "page.svg")) and \
-            ((not do_ocr) or
-             (state.get("ocr_settings") == settings and prev.get("ocr")))
-        if reuse:
-            state["sources"][src_rel] = sig
-            entry = dict(prev)
-            apply_title(entry, page_id, titles)
-            state["page_entries"][page_id] = entry
-            pages.append(entry)
-            skipped_pages += 1
-            print("page %s: unchanged, skipping" % page_id)
+    skipped = 0
+    pattern = os.path.join(lib.data_dir, "data", "*", "*", "*.stf")
+    for stf in sorted(glob.glob(pattern)):
+        entry, reused = convert_page(lib, stf)
+        if entry is None:
             continue
-
-        strokes, tmin, tmax = load_strokes(stf)
-        page_dir = os.path.join(pages_out, page_id)
-        os.makedirs(page_dir, exist_ok=True)
-        bounds = ink_bounds(strokes)
-        render_svg(strokes, os.path.join(page_dir, "page.svg"), bounds)
-        render_thumb(strokes, os.path.join(page_dir, "thumb.png"), bounds=bounds)
-        entry = {
-            "id": page_id,
-            "strokes": len(strokes),
-            "bounds": [round(b, 1) for b in bounds],
-            "svg": "pages/%s/page.svg" % page_id,
-            "thumb": "pages/%s/thumb.png" % page_id,
-        }
-        if offset is not None and tmin is not None:
-            pt = prev or {}
-            if pt.get("captured") and pt.get("pen_tmin") == tmin:
-                # freeze: keep stamps from the offset in effect when the
-                # page was synced (see the session-freeze note below)
-                entry["captured"] = pt["captured"]
-                if tmax == pt.get("pen_tmax"):
-                    entry["captured_end"] = pt.get("captured_end")
-                else:
-                    entry["captured_end"] = pen_ms_to_iso(tmax, offset)
-            else:
-                entry["captured"] = pen_ms_to_iso(tmin, offset)
-                entry["captured_end"] = pen_ms_to_iso(tmax, offset)
-            entry["pen_tmin"] = tmin
-            entry["pen_tmax"] = tmax
-        title = titles.get(page_id)
-        if title:
-            entry["title"] = title
-        if this_ocr:
-            try:
-                text, kept = ocr_page(strokes, page_dir, engine,
-                                      args.ocr_lang, args.ocr_psm)
-                prune_ocr_pngs(page_dir, kept)
-            except Exception as e:
-                print("warning: OCR failed for %s: %s" % (page_id, e),
-                      file=sys.stderr)
-                text = None
-            if text:
-                atomic_write(os.path.join(page_dir, "text.txt"), text + "\n")
-                entry["text"] = text
-                entry["ocr"] = True
-                entry["ocr_engine"] = engine
-            else:
-                # OCR failed on previously valid transcription: drop it
-                try:
-                    os.remove(os.path.join(page_dir, "text.txt"))
-                except OSError:
-                    pass
-                entry["ocr"] = False
-        else:
-            # Re-rendered without OCR against changed ink: any text/ocr
-            # images from the previous run are invalid, drop them.
-            for stale in (["text.txt"] +
-                          [os.path.basename(x) for x in
-                           glob.glob(os.path.join(page_dir, "ocr*.png"))]):
-                try:
-                    os.remove(os.path.join(page_dir, stale))
-                except OSError:
-                    pass
-        state["sources"][src_rel] = sig
-        state["page_entries"][page_id] = entry
         pages.append(entry)
+        skipped += reused
+    return pages, skipped
 
-    sessions = collect_sessions(data_dir)
+
+def convert_page(lib, stf):
+    """One page's index entry, and whether it was reused unchanged."""
+    page_id = os.path.basename(os.path.dirname(os.path.dirname(stf)))
+    src_rel = os.path.relpath(stf, ROOT)
+    sig = file_sig(stf)
+    state = lib.state
+    prev = state["page_entries"].get(page_id)
+    single_page = lib.args.page is not None
+    if single_page and page_id != lib.args.page and prev is not None:
+        # on-demand OCR of another page: keep this one as it was, and leave
+        # its recorded signature alone so an edit is still picked up later
+        return reuse_page(lib, page_id, prev), True
+    job = lib.ocr_job if not single_page or page_id == lib.args.page else None
+    has_svg = os.path.exists(os.path.join(lib.pages_out, page_id, "page.svg"))
+    if page_reusable(prev, state["sources"].get(src_rel) == sig, has_svg,
+                     job, state):
+        state["sources"][src_rel] = sig
+        return reuse_page(lib, page_id, prev), True
+    try:
+        entry, ink = render_page(lib, page_id, stf, prev)
+    except Exception as e:
+        print("warning: page %s could not be converted (%s: %s); %s"
+              % (page_id, type(e).__name__, e,
+                 "keeping its last render" if prev else "skipping it"),
+              file=sys.stderr)
+        return (dict(prev), True) if prev else (None, False)
+    last = prev or {}
+    same_ink = lib.last_sources.get(src_rel) == sig
+    if job is not None:
+        transcribe_page(entry, ink, job, last if same_ink else {})
+    elif same_ink and has_transcription(last):
+        carry_ocr(entry, last)
+    else:
+        drop_ocr_files(ink.page_dir)
+    state["sources"][src_rel] = sig
+    state["page_entries"][page_id] = entry
+    if job is not None:
+        save_state(state)   # an interrupted OCR run keeps finished pages
+    return entry, False
+
+
+def reuse_page(lib, page_id, prev):
+    entry = dict(prev)
+    apply_title(entry, page_id, lib.titles)
+    lib.state["page_entries"][page_id] = entry
+    print("page %s: unchanged, skipping" % page_id)
+    return entry
+
+
+def render_page(lib, page_id, stf, prev):
+    """Parse and render one page; returns (index entry, PageInk)."""
+    strokes, tmin, tmax = load_strokes(stf)
+    page_dir = os.path.join(lib.pages_out, page_id)
+    os.makedirs(page_dir, exist_ok=True)
+    bounds = ink_bounds(strokes)
+    render_svg(strokes, os.path.join(page_dir, "page.svg"), bounds)
+    render_thumb(strokes, os.path.join(page_dir, "thumb.png"), bounds=bounds)
+    entry = {
+        "id": page_id,
+        "strokes": len(strokes),
+        "bounds": [round(b, 1) for b in bounds],
+        "svg": "pages/%s/page.svg" % page_id,
+        "thumb": "pages/%s/thumb.png" % page_id,
+    }
+    if lib.offset is not None and tmin is not None:
+        stamp_page(entry, prev or {}, (tmin, tmax), lib.offset)
+    title = lib.titles.get(page_id)
+    if title:
+        entry["title"] = title
+    return entry, PageInk(page_id, strokes, page_dir)
+
+
+def stamp_page(entry, prev, pen_span, offset):
+    """Capture start/end stamps, frozen from ``prev`` when its ink matches.
+
+    Stamps are frozen at the offset in effect when the page was synced: a
+    later pen-clock correction rewrites the global offset, which would
+    otherwise mis-stamp pages written before the fix.
+    """
+    tmin, tmax = pen_span
+    if prev.get("captured") and prev.get("pen_tmin") == tmin:
+        entry["captured"] = prev["captured"]
+        if tmax == prev.get("pen_tmax"):
+            entry["captured_end"] = prev.get("captured_end")
+        else:
+            entry["captured_end"] = pen_ms_to_iso(tmax, offset)
+    else:
+        entry["captured"] = pen_ms_to_iso(tmin, offset)
+        entry["captured_end"] = pen_ms_to_iso(tmax, offset)
+    entry["pen_tmin"] = tmin
+    entry["pen_tmax"] = tmax
+
+
+# ---------------------------------------------------------------------------
+# sessions
+# ---------------------------------------------------------------------------
+
+SESSION_CARRY_KEYS = ("stt", "stt_sig", "transcript")
+
+
+def convert_sessions(lib):
+    """Copy session audio; returns (sessions, kept audio names, skipped)."""
+    sessions = collect_sessions(lib.data_dir)
     kept_audio = set()
-    skipped_sessions = 0
+    skipped = 0
     for s in sessions:
-        sigs = {os.path.relpath(os.path.join(data_dir, aac), ROOT): None
+        sigs = {os.path.relpath(os.path.join(lib.data_dir, aac), ROOT): None
                 for aac in s["audio"]}
         sigs = {rel: file_sig(os.path.join(ROOT, rel)) for rel in sigs}
-        prev = state.get("session_entries", {}).get(s["id"])
-        # Freeze stamps computed under the offset in effect when the
-        # session was downloaded: a pen-clock correction rewrites the
-        # global offset, which would otherwise mis-stamp every asset
-        # recorded before the fix (their pen times encode the old clock).
-        if prev and prev.get("captured") and \
-                prev.get("pen_tstart") == s.get("pen_tstart"):
-            s["captured"] = prev["captured"]
-            if prev.get("pen_tend") == s.get("pen_tend"):
-                s["captured_end"] = prev.get("captured_end")
-            # else: end grew (appended audio part); keep the fresh end,
-            # which was converted with the offset valid for that part
-        reuse = (not args.force) and bool(sigs) and prev is not None and \
-            prev.get("pages") == s["pages"] and \
-            prev.get("notebook") == s["notebook"]
-        if reuse:
-            if any(state.get("sources", {}).get(rel) != sig
-                   for rel, sig in sigs.items()):
-                reuse = False
-        if reuse:
-            for u in prev.get("urls", []):
-                if not os.path.exists(os.path.join(out_dir, u)):
-                    reuse = False
-                    break
-        if reuse:
-            reused_urls = prev["urls"]
-            # keep new parts found at the end of an existing recording
-            for i, aac in enumerate(s["audio"]):
-                expected = "audio/%s.%d.aac" % (s["id"], i)
-                if expected not in reused_urls:
-                    reused_urls.append(expected)
-                    reuse = False  # a new part was appended, copy it below
-            s["urls"] = reused_urls
-        if not reuse:
-            urls = []
-            for i, aac in enumerate(s["audio"]):
-                src = os.path.join(data_dir, aac)
-                dst = os.path.join(audio_out, "%s.%d.aac" % (s["id"], i))
-                fd, tmp = tempfile.mkstemp(
-                    dir=audio_out, prefix=s["id"] + ".", suffix=".aac.tmp")
-                try:
-                    with open(src, "rb") as fi, os.fdopen(fd, "wb") as fo:
-                        shutil.copyfileobj(fi, fo)
-                    os.replace(tmp, dst)
-                    urls.append("audio/" + os.path.basename(dst))
-                except (OSError, KeyError) as e:
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-                    print("audio copy failed for %s: %s" % (s["id"], e),
-                          file=sys.stderr)
-            s["urls"] = urls
-        else:
-            skipped_sessions += 1
+        prev = lib.state["session_entries"].get(s["id"])
+        freeze_session_stamps(s, prev)
+        if session_reusable(lib, s, prev, sigs):
+            s["urls"] = list(prev["urls"])
+            skipped += 1
             print("session %s: unchanged, skipping" % s["id"])
-        state["sources"].update(sigs)
-        entry = {
-            "urls": s["urls"], "pages": s["pages"], "notebook": s["notebook"],
-        }
-        for k in ("captured", "captured_end", "pen_tstart", "pen_tend"):
-            if s.get(k) is not None:
-                entry[k] = s[k]
-        # carry forward transcripts/stt markers from a previous run so a
-        # non-stt convert doesn't drop them; sessions rebuilt every run
-        if isinstance(prev, dict):
-            for k in ("stt", "stt_sig", "transcript"):
-                if prev.get(k) is not None:
-                    entry[k] = prev[k]
-                    if k == "transcript":
-                        s["transcript"] = prev[k]
-        state["session_entries"][s["id"]] = entry
-        for u in s["urls"]:
-            kept_audio.add(os.path.basename(u))
+        else:
+            s["urls"] = copy_session_audio(lib, s)
+        lib.state["sources"].update(sigs)
+        lib.state["session_entries"][s["id"]] = session_entry(s, prev)
+        kept_audio.update(os.path.basename(u) for u in s["urls"])
+    return sessions, kept_audio, skipped
 
-    # Session -> page linking. Session page addresses can carry a leading
-    # section component (5 parts) that .stf page ids (4 parts) lack.
-    page_ids = {p["id"] for p in pages}
+
+def freeze_session_stamps(s, prev):
+    """Keep capture stamps computed under the offset valid at download.
+
+    A pen-clock correction rewrites the global offset, which would
+    otherwise mis-stamp every recording made before the fix. When the end
+    grew (an audio part was appended) the fresh end is kept.
+    """
+    if not prev or not prev.get("captured"):
+        return
+    if prev.get("pen_tstart") != s.get("pen_tstart"):
+        return
+    s["captured"] = prev["captured"]
+    if prev.get("pen_tend") == s.get("pen_tend"):
+        s["captured_end"] = prev.get("captured_end")
+
+
+def session_audio_urls(s):
+    return ["audio/%s.%d.aac" % (s["id"], i) for i in range(len(s["audio"]))]
+
+
+def session_reusable(lib, s, prev, sigs):
+    """True when the session's copied audio matches its sources exactly."""
+    if lib.args.force or not sigs or prev is None:
+        return False
+    if prev.get("pages") != s["pages"] or prev.get("notebook") != s["notebook"]:
+        return False
+    if any(lib.state["sources"].get(rel) != sig for rel, sig in sigs.items()):
+        return False
+    if prev.get("urls") != session_audio_urls(s):
+        return False
+    return all(os.path.exists(os.path.join(lib.out_dir, u))
+               for u in prev["urls"])
+
+
+def copy_session_audio(lib, s):
+    """Copy every audio part into output/audio atomically; returns urls."""
+    urls = []
+    for i, aac in enumerate(s["audio"]):
+        src = os.path.join(lib.data_dir, aac)
+        dst = os.path.join(lib.audio_out, "%s.%d.aac" % (s["id"], i))
+        fd, tmp = tempfile.mkstemp(
+            dir=lib.audio_out, prefix=s["id"] + ".", suffix=".aac.tmp")
+        try:
+            with open(src, "rb") as fi, os.fdopen(fd, "wb") as fo:
+                shutil.copyfileobj(fi, fo)
+            os.replace(tmp, dst)
+            urls.append("audio/" + os.path.basename(dst))
+        except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            print("audio copy failed for %s: %s" % (s["id"], e),
+                  file=sys.stderr)
+    return urls
+
+
+def session_entry(s, prev):
+    """State entry for a session; carries transcripts from ``prev``."""
+    entry = {"urls": s["urls"], "pages": s["pages"], "notebook": s["notebook"]}
+    for k in ("captured", "captured_end", "pen_tstart", "pen_tend"):
+        if s.get(k) is not None:
+            entry[k] = s[k]
+    if not isinstance(prev, dict):
+        return entry
+    for k in SESSION_CARRY_KEYS:
+        if prev.get(k) is not None:
+            entry[k] = prev[k]
+    if prev.get("transcript") is not None:
+        s["transcript"] = prev["transcript"]
+    return entry
+
+
+def link_sessions(sessions, page_ids):
+    """Resolve session page addresses to page ids that exist.
+
+    Session addresses can carry a leading section component (5 parts)
+    that .stf page ids (4 parts) lack.
+    """
     for s in sessions:
         linked = []
         for raw in s.get("pages", []):
+            short = ".".join(raw.split(".")[1:])
             if raw in page_ids:
                 linked.append(raw)
-                continue
-            parts = raw.split(".")
-            if len(parts) == 5 and ".".join(parts[1:]) in page_ids:
-                linked.append(".".join(parts[1:]))
-                continue
-            print("warning: recording %s references page %s which is not "
-                  "present in the notebook" % (s["id"], raw), file=sys.stderr)
+            elif raw.count(".") == 4 and short in page_ids:
+                linked.append(short)
+            else:
+                print("warning: recording %s references page %s which is "
+                      "not present in the notebook" % (s["id"], raw),
+                      file=sys.stderr)
         s["pages"] = linked
 
-    # Prune output for sources that no longer exist (fixes accumulation of
-    # stale assets, and makes deletions from the pen/data dir stick).
-    current_pages = {p["id"] for p in pages}
-    for d in sorted(glob.glob(os.path.join(pages_out, "*"))):
-        if os.path.isdir(d) and os.path.basename(d) not in current_pages:
+
+def prune_outputs(lib, page_ids, kept_audio):
+    """Remove output whose source is gone, so deletions from data/ stick."""
+    for d in sorted(glob.glob(os.path.join(lib.pages_out, "*"))):
+        if os.path.isdir(d) and os.path.basename(d) not in page_ids:
             shutil.rmtree(d, ignore_errors=True)
             print("pruned output/pages/%s (no matching source)"
                   % os.path.basename(d))
-    for f in sorted(glob.glob(os.path.join(audio_out, "*.aac"))):
-        if os.path.basename(f) not in kept_audio:
-            try:
-                os.remove(f)
-                print("pruned output/audio/%s (no matching source)"
-                      % os.path.basename(f))
-            except OSError:
-                pass
+    for f in sorted(glob.glob(os.path.join(lib.audio_out, "*.aac"))):
+        if os.path.basename(f) in kept_audio:
+            continue
+        try:
+            os.remove(f)
+            print("pruned output/audio/%s (no matching source)"
+                  % os.path.basename(f))
+        except OSError:
+            pass
 
-    # Speech-to-text: transcribe each session's audio incrementally.
-    if do_stt:
-        total = len(sessions) - (1 if args.session else 0)
-        done = 0
-        for s in sessions:
-            sid = s["id"]
-            if args.session and sid != args.session:
-                continue
-            urls = s.get("urls") or []
-            if not urls:
-                s["transcript"] = ""
-                continue
-            sig = _audio_sig(urls, out_dir)
-            prev = state.get("session_entries", {}).get(sid, {}) or {}
-            prev_stt = prev.get("stt") or {}
-            # JSON stores tuples as lists; normalize both sides before comparing
-            cur_sig = [list(t) for t in sig]
-            prev_sig = prev.get("stt_sig") or []
-            tx_path = os.path.join(audio_out, sid + ".txt")
-            if (not args.force) and prev_stt.get("done") and \
-                    prev_stt.get("model") == stt.MOONSHINE_MODEL and \
-                    prev_sig == cur_sig and os.path.exists(tx_path):
-                s["transcript"] = prev.get("transcript", "")
-                print("session %s: transcript unchanged, skipping" % sid)
-                continue
-            aac_paths = [os.path.join(out_dir, u) for u in urls]
-            audio = stt.seq_to_floats(aac_paths)
-            try:
-                text = stt.transcribe(audio)
-            except Exception as e:
-                print("warning: STT failed for %s: %s" % (sid, e),
-                      file=sys.stderr)
-                continue
-            s["transcript"] = text or ""
-            if text:
-                atomic_write(tx_path, text + "\n")
-            else:
-                try:
-                    os.remove(tx_path)
-                except OSError:
-                    pass
-            entry = state["session_entries"].setdefault(sid, {})
-            entry["stt"] = {"done": True, "model": stt.MOONSHINE_MODEL}
-            entry["stt_sig"] = sig
-            entry["transcript"] = s["transcript"]
+
+# ---------------------------------------------------------------------------
+# speech-to-text
+# ---------------------------------------------------------------------------
+
+def transcribe_sessions(lib, sessions):
+    """Transcribe each selected session whose audio changed since last time."""
+    wanted = [s for s in sessions
+              if not lib.args.session or s["id"] == lib.args.session]
+    done = 0
+    for s in wanted:
+        if transcribe_session(lib, s):
             done += 1
-            print("session %s: transcribed (%d/%d)" % (sid, done, total))
+            print("session %s: transcribed (%d/%d)" % (s["id"], done,
+                                                      len(wanted)))
 
-    state["ocr_settings"] = settings
-    state["render_version"] = RENDER_VERSION
-    # chronological order (oldest first) for both lists; assets without a
-    # capture time fall to the end
+
+def transcript_current(lib, s, prev, sig):
+    """True when ``prev`` already holds this audio's transcript."""
+    prev_stt = prev.get("stt") or {}
+    if lib.args.force or not prev_stt.get("done"):
+        return False
+    if prev_stt.get("model") != stt.MOONSHINE_MODEL:
+        return False
+    # JSON stores tuples as lists; normalize before comparing
+    if (prev.get("stt_sig") or []) != [list(t) for t in sig]:
+        return False
+    tx_path = os.path.join(lib.audio_out, s["id"] + ".txt")
+    return os.path.exists(tx_path) or not prev.get("transcript")
+
+
+def transcribe_session(lib, s):
+    """Run STT for one session; True when a new transcript was produced."""
+    sid = s["id"]
+    urls = s.get("urls") or []
+    if not urls:
+        s["transcript"] = ""
+        return False
+    sig = _audio_sig(urls, lib.out_dir)
+    prev = lib.state["session_entries"].get(sid) or {}
+    if transcript_current(lib, s, prev, sig):
+        s["transcript"] = prev.get("transcript", "")
+        print("session %s: transcript unchanged, skipping" % sid)
+        return False
+    try:
+        text = stt.transcribe(stt.seq_to_floats(
+            [os.path.join(lib.out_dir, u) for u in urls]))
+    except Exception as e:
+        print("warning: STT failed for %s: %s" % (sid, e), file=sys.stderr)
+        return False
+    s["transcript"] = text or ""
+    tx_path = os.path.join(lib.audio_out, sid + ".txt")
+    if text:
+        atomic_write(tx_path, text + "\n")
+    else:
+        try:
+            os.remove(tx_path)
+        except OSError:
+            pass
+    entry = lib.state["session_entries"].setdefault(sid, {})
+    entry["stt"] = {"done": True, "model": stt.MOONSHINE_MODEL}
+    entry["stt_sig"] = sig
+    entry["transcript"] = s["transcript"]
+    save_state(lib.state)   # an interrupted STT run keeps finished sessions
+    return True
+
+
+def write_index(lib, pages, sessions):
+    """Publish index.json and the state that produced it."""
+    lib.state["ocr_settings"] = None
+    # chronological order (oldest first); undated assets fall to the end
     pages.sort(key=lambda p: (p.get("captured") or "9999", p["id"]))
     sessions.sort(key=lambda s: (s.get("captured") or "9999", s["id"]))
-    atomic_write(os.path.join(out_dir, "index.json"),
+    atomic_write(os.path.join(lib.out_dir, "index.json"),
                  json.dumps({"pages": pages, "sessions": sessions}, indent=2))
-    save_state(state)
-    print("rendered %d pages (%d unchanged, %d sessions (%d unchanged))"
-          % (len(pages), skipped_pages, len(sessions), skipped_sessions))
+    save_state(lib.state)
 
 
 if __name__ == "__main__":

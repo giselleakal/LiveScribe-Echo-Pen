@@ -6,9 +6,9 @@ import threading
 import unittest
 from typing import Any
 
-import tests  # noqa: F401  (sandbox ECHO_ROOT before importing serve)
-
 import serve
+
+from tests import fixtures
 
 
 class QuietHandler(serve.Handler):
@@ -19,6 +19,7 @@ class QuietHandler(serve.Handler):
 class ServeApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        fixtures.reset_sandbox()
         os.makedirs(serve.OUT, exist_ok=True)
         cls.httpd = serve.http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), QuietHandler)
@@ -51,7 +52,8 @@ class ServeApiTest(unittest.TestCase):
     def test_index_without_output_explains_what_to_run(self):
         status, body = self.request("GET", "/")
         self.assertEqual(status, 200)
-        self.assertIn("./run", body)
+        self.assertTrue(body.startswith("<h2>No converted output yet"),
+                        body[:80])
 
     def test_cross_origin_delete_is_refused(self):
         status, body = self.request(

@@ -3,10 +3,10 @@ import os
 import tempfile
 import unittest
 
+import convert
+
 import tests
 from tests import fixtures
-
-import convert
 
 
 class StfFixtureTest(unittest.TestCase):
@@ -14,6 +14,31 @@ class StfFixtureTest(unittest.TestCase):
         strokes = [[(100, 200), (150, 300), (200, 200)], [(400, 500), (420, 520)]]
         parsed = fixtures.parse_points(fixtures.stf_bytes(strokes))
         self.assertEqual([[(x, y) for x, y, _ in s] for s in parsed], strokes)
+
+    def test_truncated_file_keeps_the_complete_strokes(self):
+        whole = fixtures.stf_bytes([[(100, 200), (150, 300)],
+                                    [(400, 500), (420, 520), (440, 540)]])
+        path = os.path.join(tempfile.mkdtemp(dir=tests.SANDBOX), "cut.stf")
+        with open(path, "wb") as f:
+            f.write(whole[:-8])
+        strokes, _, _ = convert.load_strokes(path)
+        self.assertEqual([(x, y) for x, y, _ in strokes[0]],
+                         [(100, 200), (150, 300)])
+
+
+    def test_32_bit_sample_times_keep_the_stream_in_sync(self):
+        strokes = [[(100, 200), (150, 300)], [(400, 500), (420, 520)]]
+        parsed = fixtures.parse_points(
+            fixtures.stf_bytes(strokes, long_times=True))
+        self.assertEqual([[(x, y) for x, y, _ in s] for s in parsed], strokes)
+
+
+class RenderTest(unittest.TestCase):
+    def test_negative_pen_force_still_renders(self):
+        path = os.path.join(tempfile.mkdtemp(dir=tests.SANDBOX), "p.svg")
+        convert.render_svg([[(100, 100, 0), (120, 130, -1)]], path)
+        with open(path) as f:
+            self.assertIn("stroke-width", f.read())
 
 
 class GroupLinesTest(unittest.TestCase):

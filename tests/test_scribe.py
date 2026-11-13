@@ -5,9 +5,8 @@ import json
 import unittest
 from unittest import mock
 
-import tests  # noqa: F401  (sandbox ECHO_ROOT before importing scribe)
-
 import scribe
+
 
 
 class SigningTest(unittest.TestCase):

@@ -1,8 +1,7 @@
 import unittest
 
-import tests  # noqa: F401
-
 import stt
+
 
 
 class ChunksTest(unittest.TestCase):

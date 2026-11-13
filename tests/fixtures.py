@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 
+import tests
 from tests import REPO
 
 sys.path.insert(0, os.path.join(REPO, "vendor"))
@@ -21,6 +22,7 @@ _FORCE_TABLE = [
          52]],
 ]
 _HEADER_TABLE = [[1, [0]], [2, [1, 2]]]
+_HEADER2_TABLE = [[1, [0]], [2, [1, 3]]]
 _TIME_TABLE = [[1, [1]], [2, [2]], [4, [0, 3, 4]]]
 _DFORCE_TABLE = [[1, [0]]]
 
@@ -56,8 +58,12 @@ class _Bits:
         return bytes(int(joined[i:i + 8], 2) for i in range(0, len(joined), 8))
 
 
-def stf_bytes(strokes, force=20, start_ms=1000):
-    """Encode ``strokes`` (lists of (x, y) points) as an Anoto STF file."""
+def stf_bytes(strokes, force=20, start_ms=1000, long_times=False):
+    """Encode ``strokes`` (lists of (x, y) points) as an Anoto STF file.
+
+    ``long_times`` stores each sample's time in the 32-bit field instead
+    of the short Huffman code, as the pen does after a long pause.
+    """
     out = bytearray(b"\x01\x00" + b"Anoto STF v1.0" + b"\x00\x64")
     for i, stroke in enumerate(strokes):
         bits = _Bits()
@@ -68,8 +74,13 @@ def stf_bytes(strokes, force=20, start_ms=1000):
         bits.put(y0, 16)
         bits.code(_FORCE_TABLE, force)
         for x, y in stroke[1:]:
-            bits.code(_HEADER_TABLE, 1)          # timed sample
-            bits.code(_TIME_TABLE, 1)
+            if long_times:
+                bits.code(_HEADER_TABLE, 2)
+                bits.code(_HEADER2_TABLE, 3)     # 32-bit sample time
+                bits.put(1, 32)
+            else:
+                bits.code(_HEADER_TABLE, 1)      # timed sample
+                bits.code(_TIME_TABLE, 1)
             bits.put(1, 1)                       # absolute coordinates
             bits.put(x, 16)
             bits.put(y, 16)
@@ -91,13 +102,17 @@ def text_line(x, y, letters, spacing=80):
     return [glyph(x + i * spacing, y) for i in range(letters)]
 
 
-def write_page(root, page_id, strokes):
-    """Store a synthetic page where dumpscribe would put it."""
+def write_page(root, page_id, strokes, raw=None):
+    """Store a synthetic page where dumpscribe would put it.
+
+    ``raw`` replaces the encoded strokes with arbitrary bytes, to model a
+    corrupt or truncated download.
+    """
     page_dir = os.path.join(root, "data", "data", page_id, "0")
     os.makedirs(page_dir, exist_ok=True)
     path = os.path.join(page_dir, "page.stf")
     with open(path, "wb") as f:
-        f.write(stf_bytes(strokes))
+        f.write(stf_bytes(strokes) if raw is None else raw)
     return path
 
 
@@ -143,6 +158,16 @@ def parse_points(data):
     c = _Collector(io.BytesIO(data))
     c.parse()
     return c.strokes
+
+
+def reset_sandbox():
+    """Empty the shared test ECHO_ROOT so tests don't see each other's output."""
+    for name in os.listdir(tests.SANDBOX):
+        path = os.path.join(tests.SANDBOX, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
 
 
 def fresh_root(base, name):
