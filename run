@@ -59,6 +59,10 @@ if [ -z "${ECHO_RUN_ID:-}" ]; then
 fi
 export ECHO_RUN_ID
 
+# Keep logs/echo.jsonl bounded: rotated here, once per invocation, so the
+# processes writing to it never race to rotate it themselves.
+"$PYTHON" "$ROOT/src/telemetry.py" rotate >/dev/null 2>&1 || true
+
 # Record one structured event from bash; never fails the caller.
 #   log_event <event> [key=value ...] [--level WARNING]
 log_event() {

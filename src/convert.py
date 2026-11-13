@@ -85,6 +85,8 @@ def acquire_lock(wait=3.0):
     """
     if os.environ.get("ECHO_LOCK_HELD"):
         return False
+    if getattr(_held, "fd", None) is not None:
+        return False   # this thread already holds it; its caller releases
     fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
     started = time.monotonic()
     deadline = started + wait
@@ -409,6 +411,16 @@ def stroke_bounds(stroke):
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def stroke_height(stroke):
+    _, y0, _, y1 = stroke_bounds(stroke)
+    return y1 - y0
+
+
+def median_height(strokes):
+    heights = sorted(stroke_height(s) for s in strokes)
+    return heights[len(heights) // 2] or 1.0
+
+
 def group_lines(strokes, oversize_ratio=None):
     """Split strokes into text lines using their vertical position.
 
@@ -423,8 +435,7 @@ def group_lines(strokes, oversize_ratio=None):
     for stroke in strokes:
         _, y0, _, y1 = stroke_bounds(stroke)
         info.append((stroke, y0, y1, (y0 + y1) / 2.0, y1 - y0))
-    heights = sorted(i[4] for i in info)
-    median_h = heights[len(heights) // 2] or 1.0
+    median_h = median_height(strokes)
     ceiling = oversize_ceiling(strokes, oversize_ratio)
     tall = [i for i in info if 0.35 * median_h <= i[4] <= ceiling] or info
 
@@ -458,9 +469,7 @@ def oversize_ceiling(strokes, ratio):
     """
     if not ratio or not strokes:
         return float("inf")
-    heights = sorted(stroke_bounds(s)[3] - stroke_bounds(s)[1]
-                     for s in strokes)
-    return ratio * (heights[len(heights) // 2] or 1.0)
+    return ratio * median_height(strokes)
 
 
 def line_frame(strokes, ceiling):
@@ -469,19 +478,18 @@ def line_frame(strokes, ceiling):
     A margin line or a bracket assigned to a text line must not stretch
     that line's image or its height.
     """
-    frame = [s for s in strokes
-             if stroke_bounds(s)[3] - stroke_bounds(s)[1] <= ceiling]
+    frame = [s for s in strokes if stroke_height(s) <= ceiling]
     return frame or strokes
 
 
 def split_wide_line(strokes, max_aspect, ceiling=float("inf")):
-    """Split one line into chunks no wider than ``max_aspect`` × its height.
+    """Split one line into chunks of roughly ``max_aspect`` × its height.
 
     TrOCR squeezes every image into a 384×384 square, so a very long line
-    loses most of its horizontal detail. Cuts go at the widest gaps
-    between strokes (word spaces), never through a stroke; a line with no
-    gaps, or a short one, is returned whole. The height ignores strokes
-    taller than ``ceiling``.
+    loses most of its horizontal detail. Cuts go only at the widest gaps
+    between strokes (word spaces), never through a stroke, so a chunk can
+    stay wider than the target when its words have no gaps; a short line
+    is returned whole. The height ignores strokes taller than ``ceiling``.
     """
     if not max_aspect or len(strokes) < 2:
         return [strokes]
@@ -700,33 +708,52 @@ def ocr_page(strokes, page_dir, job):
         render_png(strokes, ocr_png, width=2000, grid=False, bounds=bounds)
         text = ocr.image_to_text(ocr_png, lang=job.lang, psm=job.psm)
         return OcrResult(clean_ocr_text(text), ["ocr.png"], True)
-    texts, kept = [], []
-    lines = group_lines(strokes, oversize_ratio=prof.oversize_ratio)
     ceiling = oversize_ceiling(strokes, prof.oversize_ratio)
-    failures = 0
-    for i, line in enumerate(lines):
-        chunks = split_wide_line(line, prof.max_line_aspect, ceiling)
-        words = []
-        for j, chunk in enumerate(chunks):
-            name = ("ocr-line-%d.png" % i if len(chunks) == 1
-                    else "ocr-line-%d-%d.png" % (i, j))
-            line_png = os.path.join(page_dir, name)
-            render_line_png(chunk, line_png,
-                            frame=line_frame(chunk, ceiling))
-            kept.append(name)
-            try:
-                words.append(ocr.trocr_image_to_text(line_png, prof))
-            except Exception as e:
-                failures += 1
-                telemetry.warn(log, "ocr.line_failed",
-                               "TrOCR failed on line %d: %s" % (i, e),
-                               line=i, chunk=j, png=line_png,
-                               exc_type=type(e).__name__)
-        texts.append(" ".join(w for w in words if w))
+    texts, kept, failures = [], [], 0
+    for i, line in enumerate(group_lines(strokes, prof.oversize_ratio)):
+        text, names, failed = read_line(LineJob(i, line, page_dir, prof,
+                                                ceiling))
+        texts.append(text)
+        kept += names
+        failures += failed
     if kept and failures == len(kept):
         raise RuntimeError("TrOCR failed on all %d lines" % failures)
     text = clean_ocr_text("\n".join(t for t in texts if t))
     return OcrResult(text, kept, failures == 0)
+
+
+@dataclasses.dataclass(frozen=True)
+class LineJob:
+    index: int
+    strokes: list
+    page_dir: str
+    prof: "ocr.Profile"
+    ceiling: float
+
+
+def read_line(job):
+    """TrOCR one text line, in chunks if it is very wide.
+
+    Returns (text, image names, chunks that failed).
+    """
+    chunks = split_wide_line(job.strokes, job.prof.max_line_aspect,
+                             job.ceiling)
+    words, names, failed = [], [], 0
+    for j, chunk in enumerate(chunks):
+        name = ("ocr-line-%d.png" % job.index if len(chunks) == 1
+                else "ocr-line-%d-%d.png" % (job.index, j))
+        png = os.path.join(job.page_dir, name)
+        render_line_png(chunk, png, frame=line_frame(chunk, job.ceiling))
+        names.append(name)
+        try:
+            words.append(ocr.trocr_image_to_text(png, job.prof))
+        except Exception as e:
+            failed += 1
+            telemetry.warn(log, "ocr.line_failed",
+                           "TrOCR failed on line %d: %s" % (job.index, e),
+                           line=job.index, chunk=j, png=png,
+                           exc_type=type(e).__name__)
+    return " ".join(w for w in words if w), names, failed
 
 
 def has_transcription(entry):
@@ -877,6 +904,24 @@ def _audio_sig(urls, out_dir):
 # main
 # ---------------------------------------------------------------------------
 
+def choose_ocr_engine(wanted):
+    """The engine to use for ``wanted`` (auto/trocr/tesseract), falling back
+    to the other one when it is missing; None when neither is installed."""
+    have = {"trocr": ocr.trocr_available(), "tesseract": ocr.available()}
+    order = ["trocr", "tesseract"] if wanted in ("auto", "trocr") \
+        else ["tesseract", "trocr"]
+    engine = next((e for e in order if have[e]), None)
+    if engine is None:
+        telemetry.warn(log, "ocr.unavailable",
+                       "--ocr requested but no OCR engine is available; "
+                       "skipping OCR (run ./run doctor)")
+    elif wanted != "auto" and engine != wanted:
+        telemetry.warn(log, "ocr.engine_fallback",
+                       "%s is not available; falling back to %s"
+                       % (wanted, engine), wanted=wanted, using=engine)
+    return engine
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Convert dumpscribe data into web output.")
     ap.add_argument("--ocr", action="store_true",
@@ -903,34 +948,10 @@ def main(argv=None):
                     help="only OCR/render this one page id; others are reused")
     args = ap.parse_args(argv)
 
-    do_ocr = args.ocr
-    engine = args.ocr_engine
-    if do_ocr:
-        tr_ok = ocr.trocr_available()
-        ts_ok = ocr.available()
-        if engine == "auto":
-            engine = "trocr" if tr_ok else ("tesseract" if ts_ok else None)
-        elif engine == "trocr" and not tr_ok:
-            telemetry.warn(log, "ocr.engine_fallback",
-                           "TrOCR is not available (use the project .venv); "
-                           "falling back to Tesseract",
-                           wanted="trocr", tesseract=ts_ok)
-            engine = "tesseract" if ts_ok else None
-        elif engine == "tesseract" and not ts_ok:
-            telemetry.warn(log, "ocr.engine_fallback",
-                           "tesseract is not installed; falling back to TrOCR",
-                           wanted="tesseract", trocr=tr_ok)
-            engine = "trocr" if tr_ok else None
-        if engine is None:
-            telemetry.warn(log, "ocr.unavailable",
-                           "--ocr requested but no OCR engine is available; "
-                           "skipping OCR (run ./run doctor)")
-            do_ocr = False
-        else:
-            print("OCR engine: %s" % engine)
-
     ocr_job = None
-    if do_ocr and engine:
+    engine = choose_ocr_engine(args.ocr_engine) if args.ocr else None
+    if engine:
+        print("OCR engine: %s" % engine)
         ocr_job = OcrJob(engine, args.ocr_lang, args.ocr_psm,
                          args.ocr_profile)
 
@@ -1278,17 +1299,25 @@ def link_sessions(sessions, page_ids):
     for s in sessions:
         linked = []
         for raw in s.get("pages", []):
-            short = ".".join(raw.split(".")[1:])
-            if raw in page_ids:
-                linked.append(raw)
-            elif raw.count(".") == 4 and short in page_ids:
-                linked.append(short)
-            else:
-                telemetry.warn(log, "session.missing_page",
-                               "recording %s references page %s which is "
-                               "not present in the notebook" % (s["id"], raw),
-                               session=s["id"], page=raw)
+            page_id = resolve_page(raw, page_ids)
+            if page_id:
+                linked.append(page_id)
+                continue
+            telemetry.warn(log, "session.missing_page",
+                           "recording %s references page %s which is "
+                           "not present in the notebook" % (s["id"], raw),
+                           session=s["id"], page=raw)
         s["pages"] = linked
+
+
+def resolve_page(address, page_ids):
+    """The page id a session address names, or None if it isn't here."""
+    if address in page_ids:
+        return address
+    short = ".".join(address.split(".")[1:])
+    if address.count(".") == 4 and short in page_ids:
+        return short
+    return None
 
 
 def prune_outputs(lib, page_ids, kept_audio):

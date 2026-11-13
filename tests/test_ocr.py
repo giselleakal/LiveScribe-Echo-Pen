@@ -41,6 +41,24 @@ class ProfileTest(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class EngineChoiceTest(unittest.TestCase):
+    def choose(self, wanted, trocr, tesseract):
+        with mock.patch.object(ocr, "trocr_available", lambda: trocr), \
+                mock.patch.object(ocr, "available", lambda: tesseract):
+            return convert.choose_ocr_engine(wanted)
+
+    def test_auto_prefers_trocr_then_tesseract(self):
+        self.assertEqual(self.choose("auto", True, True), "trocr")
+        self.assertEqual(self.choose("auto", False, True), "tesseract")
+
+    def test_a_missing_engine_falls_back_to_the_other(self):
+        self.assertEqual(self.choose("trocr", False, True), "tesseract")
+        self.assertEqual(self.choose("tesseract", True, False), "trocr")
+
+    def test_nothing_installed_means_no_ocr(self):
+        self.assertIsNone(self.choose("auto", False, False))
+
+
 class OversizeStrokeTest(unittest.TestCase):
     def setUp(self):
         top = fixtures.text_line(100, 400, 5)

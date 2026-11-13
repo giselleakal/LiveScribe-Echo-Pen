@@ -1,6 +1,6 @@
 """Structured logs for the Echo pipeline, written for whoever debugs it next.
 
-Every record is one JSON line in ``logs/echo.jsonl`` (rotated, gitignored)
+Every record is one JSON line in ``logs/echo.jsonl`` (gitignored)
 with a UTC timestamp, level, component, event name and the ``run_id`` of
 the ``./run`` invocation that caused it; serve.py adds a ``request_id``
 per HTTP request and hands both to the convert processes it starts.
@@ -38,8 +38,7 @@ import uuid
 import paths
 
 LOG_PATH = os.path.join(paths.LOGS, "echo.jsonl")
-MAX_LOG_BYTES = 5 * 1024 * 1024
-LOG_BACKUPS = 3
+MAX_LOG_BYTES = 5 * 1024 * 1024   # ./run rotates to echo.jsonl.1 above this
 STDERR_TAIL_CHARS = 500
 SECRET_KEYS = ("secret", "token", "password", "authorization", "cookie",
                "signature", "api_key")
@@ -57,16 +56,18 @@ monotonic = time.monotonic
 
 _configured = False
 _configure_lock = threading.Lock()
+_run_id_lock = threading.Lock()
 _context = threading.local()   # per-thread fields, e.g. serve's request_id
 
 
 def run_id():
     """The correlation id of this run, minted once and inherited by children."""
-    rid = os.environ.get("ECHO_RUN_ID")
-    if not rid:
-        rid = uuid.uuid4().hex[:12]
-        os.environ["ECHO_RUN_ID"] = rid
-    return rid
+    with _run_id_lock:
+        rid = os.environ.get("ECHO_RUN_ID")
+        if not rid:
+            rid = uuid.uuid4().hex[:12]
+            os.environ["ECHO_RUN_ID"] = rid
+        return rid
 
 
 def request_id():
@@ -118,22 +119,32 @@ def redact(value, key=""):
     return value
 
 
-class ReopeningFileHandler(logging.handlers.RotatingFileHandler):
-    """Rotating JSONL file that is recreated if someone deletes logs/."""
+class LogFile(logging.handlers.WatchedFileHandler):
+    """The shared JSONL file: many processes append whole lines to it.
+
+    Writers never rotate it themselves (``rotate()`` runs once per ./run
+    invocation); each reopens the file when it is renamed or deleted, and
+    recreates logs/ if that is gone too.
+    """
 
     def emit(self, record):
         try:
-            if self.stream is not None and \
-                    not os.path.exists(self.baseFilename):
-                self.stream.close()
-                self.stream = None   # reopened by emit() below
-            if self.stream is None:
-                os.makedirs(os.path.dirname(self.baseFilename),
-                            exist_ok=True)
+            os.makedirs(os.path.dirname(self.baseFilename), exist_ok=True)
         except OSError:
             self.handleError(record)
             return
         super().emit(record)
+
+
+def rotate(path=LOG_PATH, limit=MAX_LOG_BYTES):
+    """Move a log larger than ``limit`` to ``<path>.1``; True if moved."""
+    try:
+        if os.path.getsize(path) <= limit:
+            return False
+        os.replace(path, path + ".1")
+    except OSError:
+        return False
+    return True
 
 
 class StderrHandler(logging.StreamHandler):
@@ -221,9 +232,7 @@ def _attach_handlers():
     level = _level("ECHO_LOG_LEVEL", logging.INFO)
     try:
         os.makedirs(paths.LOGS, exist_ok=True)
-        handler = ReopeningFileHandler(
-            LOG_PATH, maxBytes=MAX_LOG_BYTES, backupCount=LOG_BACKUPS,
-            encoding="utf-8")
+        handler = LogFile(LOG_PATH, encoding="utf-8")
         handler.setLevel(level)
         handler.setFormatter(JsonFormatter())
         root.addHandler(handler)
@@ -297,17 +306,22 @@ def tail(text, limit=STDERR_TAIL_CHARS):
 # ---------------------------------------------------------------------------
 
 def read_records(path=LOG_PATH):
-    """Every parseable record, oldest first, across rotated files."""
-    files = [f"{path}.{i}" for i in range(LOG_BACKUPS, 0, -1)] + [path]
-    for name in files:
+    """Every parseable record, oldest first, including the rotated file."""
+    yield from _records_in(path + ".1")
+    yield from _records_in(path)
+
+
+def _records_in(name):
+    """Records of one log file; a missing file or bad line is skipped."""
+    try:
+        with open(name, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    for line in lines:
         try:
-            with open(name, encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        yield json.loads(line)
-                    except ValueError:
-                        continue
-        except OSError:
+            yield json.loads(line)
+        except ValueError:
             continue
 
 
@@ -335,7 +349,10 @@ def parse_fields(pairs):
     out = {}
     for pair in pairs:
         key, _, value = pair.partition("=")
-        out[key] = int(value) if value.lstrip("-").isdigit() else value
+        try:
+            out[key] = int(value)
+        except ValueError:
+            out[key] = value
     return out
 
 
@@ -367,10 +384,14 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["event"]:
         return record_event(argv[1:])
+    if argv[:1] == ["rotate"]:
+        rotate()
+        return 0
     ap = argparse.ArgumentParser(description="Read or write pipeline logs.")
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("event", help="record one event (for ./run): "
                                  "event <component> <name> [key=value ...]")
+    sub.add_parser("rotate", help="move a large log aside (./run does this)")
     logs = sub.add_parser("logs", help="print recent log records")
     logs.add_argument("--errors", action="store_true",
                       help="only warnings and errors")

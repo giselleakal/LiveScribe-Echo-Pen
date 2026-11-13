@@ -97,6 +97,32 @@ class RecordShapeTest(unittest.TestCase):
         self.assertEqual(seen, {f"r{i}": f"r{i}" for i in range(5)})
 
 
+class RotationTest(unittest.TestCase):
+    def setUp(self):
+        fixtures.reset_sandbox()
+        self.log = telemetry.get_logger("test")
+
+    def test_large_log_moves_aside_and_writers_follow(self):
+        self.log.info("before")
+        self.assertTrue(telemetry.rotate(limit=1))
+        self.log.info("after")
+        self.assertEqual([r["event"] for r in records()][-2:],
+                         ["before", "after"])
+        with open(telemetry.LOG_PATH) as f:
+            self.assertEqual([json.loads(line)["event"] for line in f],
+                             ["after"])
+
+    def test_small_log_stays(self):
+        self.log.info("x")
+        self.assertFalse(telemetry.rotate())
+
+    def test_deleted_logs_directory_is_recreated(self):
+        self.log.info("first")
+        fixtures.shutil.rmtree(os.path.dirname(telemetry.LOG_PATH))
+        self.log.info("second")
+        self.assertEqual([r["event"] for r in records()], ["second"])
+
+
 class IoCallTest(unittest.TestCase):
     def setUp(self):
         fixtures.reset_sandbox()
@@ -153,6 +179,10 @@ class CliTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         rec = last("io")
         self.assertEqual((rec["level"], rec["status"]), ("WARNING", 3))
+
+    def test_field_values_parse_as_int_only_when_they_are_ints(self):
+        self.assertEqual(telemetry.parse_fields(["a=3", "b=-2", "c=--5", "d=x"]),
+                         {"a": 3, "b": -2, "c": "--5", "d": "x"})
 
     def test_record_count_must_be_positive(self):
         self.cli("event", "run", "x")

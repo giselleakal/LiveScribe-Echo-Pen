@@ -82,6 +82,12 @@ class LockTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             convert.acquire_lock(wait=0.2)
 
+    def test_same_thread_taking_the_lock_twice_does_not_deadlock(self):
+        self.assertTrue(convert.acquire_lock(wait=0.2))
+        self.assertFalse(convert.acquire_lock(wait=0.2))
+        convert.release_lock()
+        self.assertFalse(convert.lock_is_held())
+
     def test_lock_is_free_again_after_release(self):
         self.assertTrue(convert.acquire_lock(wait=0.2))
         convert.release_lock()

@@ -849,7 +849,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         """Handle one request with its own request_id and one http record.
 
         POSTs log at INFO; GETs (page loads, thumbnails, audio) at DEBUG so
-        browsing does not flood the log. Errors are always WARNING.
+        browsing does not flood the log. Server errors (5xx) are WARNING;
+        refused requests (4xx) are expected and keep the normal level.
         """
         self._status = None
         started = telemetry.monotonic()
